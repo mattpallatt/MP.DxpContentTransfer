@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk.Razor">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <AddRazorSupportForMvc>true</AddRazorSupportForMvc>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="EPiServer.CMS.Core" Version="12.23.1" />
+    <PackageReference Include="EPiServer.CMS.UI.Core" Version="12.34.4" />
+  </ItemGroup>
+</Project>
