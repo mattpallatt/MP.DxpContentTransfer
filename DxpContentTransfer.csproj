@@ -4,10 +4,22 @@
     <AddRazorSupportForMvc>true</AddRazorSupportForMvc>
     <Nullable>disable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+    <PackageId>MP.DxpContentTransfer</PackageId>
+    <Version>0.1.0</Version>
+    <Authors>Matt Pallatt</Authors>
+    <Description>An Optimizely CMS 12 gadget that lets editors push content between DXP environments (Integration, Preproduction, Production) directly from the editor sidebar — no developer involvement required.</Description>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <ProjectUrl>https://github.com/mattpallatt/MP.DxpContentTransfer</ProjectUrl>
+    <RepositoryUrl>https://github.com/mattpallatt/MP.DxpContentTransfer</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="EPiServer.CMS.Core" Version="12.23.1" />
-    <PackageReference Include="EPiServer.CMS.UI.Core" Version="12.34.4" />
+    <None Include="README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="EPiServer.CMS.Core" Version="[12.0.0, 13.0.0)" />
+    <PackageReference Include="EPiServer.CMS.UI.Core" Version="[12.0.0, 13.0.0)" />
   </ItemGroup>
 </Project>
