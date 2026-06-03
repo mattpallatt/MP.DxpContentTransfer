@@ -5,13 +5,31 @@ namespace DxpContentTransfer.Services;
 
 public class DxpSettingsService : IDxpSettingsService
 {
+    // DynamicDataStoreFactory uses IDatabaseExecutor which has thread affinity — calling it
+    // from a background Task.Run thread after a previous request causes "executor not created
+    // on current context" errors. Cache the settings after the first HTTP-thread load so that
+    // background threads never touch DDS directly.
+    private DxpTransferSettings _cached;
+    private readonly object _lock = new();
+
     public DxpTransferSettings Get()
     {
-        var store = DynamicDataStoreFactory.Instance.GetStore(typeof(DxpTransferSettings));
-        if (store == null)
-            return new DxpTransferSettings();
+        lock (_lock)
+        {
+            if (_cached != null) return _cached;
+        }
 
-        return store.LoadAll<DxpTransferSettings>().FirstOrDefault() ?? new DxpTransferSettings();
+        var store = DynamicDataStoreFactory.Instance.GetStore(typeof(DxpTransferSettings));
+        var settings = store == null
+            ? new DxpTransferSettings()
+            : store.LoadAll<DxpTransferSettings>().FirstOrDefault() ?? new DxpTransferSettings();
+
+        lock (_lock)
+        {
+            _cached = settings;
+        }
+
+        return settings;
     }
 
     public void Save(DxpTransferSettings settings)
@@ -21,10 +39,13 @@ public class DxpSettingsService : IDxpSettingsService
 
         var existing = store.LoadAll<DxpTransferSettings>().FirstOrDefault();
         if (existing != null)
-        {
             settings.Id = existing.Id;
-        }
 
         store.Save(settings);
+
+        lock (_lock)
+        {
+            _cached = settings;
+        }
     }
 }

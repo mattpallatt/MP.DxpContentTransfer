@@ -16,4 +16,6 @@ public class TransferItemResult
     public string ErrorMessage { get; set; }
     public int? TargetContentId { get; set; }
     public string TargetBaseUrl { get; set; }
+    public List<string> DefaultedProperties { get; set; } = new();
+    public List<string> FailedDependencyGuids { get; set; } = new();
 }

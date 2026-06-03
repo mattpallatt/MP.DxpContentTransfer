@@ -42,7 +42,7 @@ public class DxpGadgetController : Controller
         var currentHost = _httpContextAccessor.HttpContext?.Request.Host.Host ?? string.Empty;
         var currentEnv = DetectCurrentEnvironment(settings, currentHost);
 
-        var (contentName, isPage) = ResolveContentInfo(contentId);
+        var (contentName, isPage, isPublished) = ResolveContentInfo(contentId);
 
         var availableTargets = settings.AllEnvironments
             .Where(e => e.IsConfigured && !string.Equals(e.Name, currentEnv, StringComparison.OrdinalIgnoreCase))
@@ -55,29 +55,32 @@ public class DxpGadgetController : Controller
             CurrentEnvironmentName = currentEnv ?? "Unknown",
             AvailableTargets = availableTargets,
             IsSettingsConfigured = settings.AllEnvironments.Any(e => e.IsConfigured),
-            IsPageContent = isPage
+            IsPageContent = isPage,
+            IsPublished = isPublished
         };
 
         return View("~/Views/DxpGadget/Index.cshtml", model);
     }
 
-    private (string name, bool isPage) ResolveContentInfo(string contentId)
+    private (string name, bool isPage, bool isPublished) ResolveContentInfo(string contentId)
     {
         if (string.IsNullOrWhiteSpace(contentId))
-            return ("(no page selected)", false);
+            return ("(no page selected)", false, false);
 
         var parts = contentId.Split('_', ':');
         if (!int.TryParse(parts[0], out var id))
-            return (contentId, false);
+            return (contentId, false, false);
 
         try
         {
             var content = _contentLoader.Get<IContent>(new ContentReference(id));
-            return (content?.Name ?? contentId, content is PageData);
+            var isPage = content is PageData;
+            var isPublished = !(content is IVersionable v) || v.Status == VersionStatus.Published;
+            return (content?.Name ?? contentId, isPage, isPublished);
         }
         catch
         {
-            return (contentId, false);
+            return (contentId, false, false);
         }
     }
 

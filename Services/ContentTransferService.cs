@@ -56,59 +56,104 @@ public class ContentTransferService : IContentTransferService
         if (target == null || !target.IsConfigured)
             return new PreCheckResult { Success = false, ErrorMessage = $"Target environment '{targetEnvironmentName}' is not configured." };
 
-        string targetToken;
-        try { targetToken = await _tokenService.GetTokenAsync(target); }
-        catch (Exception ex) { return new PreCheckResult { Success = false, ErrorMessage = $"Failed to authenticate with target environment: {ex.Message}" }; }
-
         var contentRef = ParseContentReference(contentId);
         if (contentRef == ContentReference.EmptyReference)
             return new PreCheckResult { Success = false, ErrorMessage = $"Invalid content reference: {contentId}" };
 
-        var result = new PreCheckResult { Success = true };
-        // Maps sourceGuid → the GUID that item will use on target (same GUID for Create/Overwrite, new GUID for CreateNew).
-        // Used so children in the same batch can find their parent without needing it to exist on target yet.
+        // Pre-load ALL IContentLoader/IUrlResolver data synchronously BEFORE the first await.
+        // IDatabaseExecutor is not thread-safe; any await can resume on a different thread pool thread.
         var batchGuidMap = new Dictionary<Guid, Guid>();
-        // Tracks GUIDs already scanned for dependencies so each asset/block is counted once.
+        // Source GUIDs of batch items whose action is not Overwrite (i.e. being created fresh).
+        // Any descendant of these must also be created fresh, even if its GUID exists elsewhere on target.
+        var batchForcedNew = new HashSet<Guid>();
         var depSeen = new HashSet<Guid>();
+        var (siteRootGuid, siteRootPath) = GetSiteRootFallback();
 
-        foreach (var itemRef in CollectItems(contentRef, includeChildren))
-        {
-            var item = await BuildPreCheckItemAsync(itemRef, target, targetToken, overwriteMatchingIds, batchGuidMap);
-
-            // Scan the page's blocks, media, and inline images for the hierarchical plan display.
-            try
+        var itemContexts = CollectItems(contentRef, includeChildren)
+            .Select(itemRef =>
             {
-                if (!ContentReference.IsNullOrEmpty(itemRef))
+                IContent content = null;
+                try { if (!ContentReference.IsNullOrEmpty(itemRef)) content = _contentLoader.Get<IContent>(itemRef, LanguageSelector.AutoDetect(true)); }
+                catch { }
+
+                Guid? directParentSourceGuid = null;
+                string directParentName = null;
+                if (content != null && !ContentReference.IsNullOrEmpty(content.ParentLink))
                 {
-                    var content = _contentLoader.Get<IContent>(itemRef);
-                    if (content is PageData)
+                    try
                     {
-                        depSeen.Add(content.ContentGuid);
-                        item.Dependencies = ScanContentDependencies(content, depSeen);
+                        var parent = _contentLoader.Get<IContent>(content.ParentLink, LanguageSelector.AutoDetect(true));
+                        directParentSourceGuid = parent.ContentGuid;
+                        directParentName = parent.Name;
+                    }
+                    catch { }
+                }
+
+                var ancestorsWithUrls = new List<(IContent ancestor, string url)>();
+                if (content != null)
+                {
+                    foreach (var a in BuildAncestorChain(content.ParentLink))
+                    {
+                        string url = null;
+                        try { url = _urlResolver.GetUrl(a.ContentLink); }
+                        catch { }
+                        ancestorsWithUrls.Add((a, url));
                     }
                 }
-            }
-            catch { /* dependency scan is best-effort */ }
 
+                var deps = new List<DependencyNode>();
+                if (content is PageData)
+                {
+                    depSeen.Add(content.ContentGuid);
+                    deps = ScanContentDependencies(content, depSeen);
+                }
+
+                return (itemRef, content, directParentSourceGuid, directParentName, ancestorsWithUrls, deps);
+            })
+            .ToList();
+
+        // All IContentLoader work done — now safe to await.
+        string targetToken;
+        try { targetToken = await _tokenService.GetTokenAsync(target); }
+        catch (Exception ex) { return new PreCheckResult { Success = false, ErrorMessage = $"Failed to authenticate with target environment: {ex.Message}" }; }
+
+        var result = new PreCheckResult { Success = true };
+
+        foreach (var (itemRef, content, directParentSourceGuid, directParentName, ancestorsWithUrls, deps) in itemContexts)
+        {
+            var item = await BuildPreCheckItemAsync(
+                itemRef, content,
+                directParentSourceGuid, directParentName, ancestorsWithUrls,
+                siteRootGuid, siteRootPath,
+                target, targetToken, overwriteMatchingIds, batchGuidMap, batchForcedNew);
+
+            item.Dependencies = deps;
             result.Items.Add(item);
+
             if (item.ContentGuid != Guid.Empty)
             {
                 var targetGuid = item.Action == PreCheckAction.CreateNew
                     ? (item.NewGuid ?? item.ContentGuid)
                     : item.ContentGuid;
                 batchGuidMap[item.ContentGuid] = targetGuid;
+
+                // Not an in-place overwrite → children cannot exist in context on the target
+                if (item.Action != PreCheckAction.Overwrite)
+                    batchForcedNew.Add(item.ContentGuid);
             }
         }
 
         return result;
     }
 
-    // Scans a page or block's properties to build the nested dependency tree shown in the plan.
+    // Scans a page, block, or inline PropertyBlock's properties to build the nested dependency
+    // tree shown in the plan. Accepts IContentData so it can recurse into PropertyBlock values
+    // (inline blocks have no GUID and don't implement IContent).
     // Uses IContentLoader (local, fast) so no API calls needed at pre-check time.
-    private List<DependencyNode> ScanContentDependencies(IContent content, HashSet<Guid> seen)
+    private List<DependencyNode> ScanContentDependencies(IContentData contentData, HashSet<Guid> seen)
     {
         var nodes = new List<DependencyNode>();
-        if (content is not IContentData contentData) return nodes;
+        if (contentData == null) return nodes;
 
         foreach (var prop in contentData.Property)
         {
@@ -118,15 +163,20 @@ public class ContentTransferService : IContentTransferService
                 {
                     try
                     {
-                        var child = _contentLoader.Get<IContent>(areaItem.ContentLink);
+                        if (IsSystemContentReference(areaItem.ContentLink)) continue;
+                        var child = _contentLoader.Get<IContent>(areaItem.ContentLink, LanguageSelector.AutoDetect(true));
                         if (!seen.Add(child.ContentGuid)) continue;
                         if (child is IContentMedia)
                         {
-                            nodes.Add(new DependencyNode { Name = child.Name, NodeType = "Image" });
+                            nodes.Add(new DependencyNode { Name = child.Name, NodeType = GetMediaNodeType(child.Name), ContentGuid = child.ContentGuid.ToString("D") });
+                        }
+                        else if (child is PageData)
+                        {
+                            nodes.Add(new DependencyNode { Name = child.Name, NodeType = "Page", ContentGuid = child.ContentGuid.ToString("D") });
                         }
                         else
                         {
-                            var blockNode = new DependencyNode { Name = child.Name, NodeType = "Block" };
+                            var blockNode = new DependencyNode { Name = child.Name, NodeType = "Block", ContentGuid = child.ContentGuid.ToString("D") };
                             blockNode.Children = ScanContentDependencies(child, seen);
                             nodes.Add(blockNode);
                         }
@@ -138,9 +188,14 @@ public class ContentTransferService : IContentTransferService
             {
                 try
                 {
-                    var child = _contentLoader.Get<IContent>(cref.ContentLink);
-                    if (child is IContentMedia && seen.Add(child.ContentGuid))
-                        nodes.Add(new DependencyNode { Name = child.Name, NodeType = "Image" });
+                    if (IsSystemContentReference(cref.ContentLink)) continue;
+                    if (IsSystemPropertyName(prop.Name)) continue;
+                    var child = _contentLoader.Get<IContent>(cref.ContentLink, LanguageSelector.AutoDetect(true));
+                    if (!seen.Add(child.ContentGuid)) continue;
+                    if (child is IContentMedia)
+                        nodes.Add(new DependencyNode { Name = child.Name, NodeType = GetMediaNodeType(child.Name), ContentGuid = child.ContentGuid.ToString("D") });
+                    else if (child is PageData)
+                        nodes.Add(new DependencyNode { Name = child.Name, NodeType = "Page", ContentGuid = child.ContentGuid.ToString("D") });
                 }
                 catch { }
             }
@@ -150,12 +205,27 @@ public class ContentTransferService : IContentTransferService
                 {
                     try
                     {
-                        var child = _contentLoader.Get<IContent>(refVal);
-                        if (child is IContentMedia && seen.Add(child.ContentGuid))
-                            nodes.Add(new DependencyNode { Name = child.Name, NodeType = "Image" });
+                        if (IsSystemContentReference(refVal)) continue;
+                        var child = _contentLoader.Get<IContent>(refVal, LanguageSelector.AutoDetect(true));
+                        if (!seen.Add(child.ContentGuid)) continue;
+                        if (child is IContentMedia)
+                            nodes.Add(new DependencyNode { Name = child.Name, NodeType = GetMediaNodeType(child.Name), ContentGuid = child.ContentGuid.ToString("D") });
+                        else if (child is PageData)
+                            nodes.Add(new DependencyNode { Name = child.Name, NodeType = "Page", ContentGuid = child.ContentGuid.ToString("D") });
                     }
                     catch { }
                 }
+            }
+            else if (prop.Value is BlockData inlineBlock)
+            {
+                // PropertyBlock — inline block embedded directly in the property (no separate GUID).
+                // Recurse to surface any media or content refs it contains.
+                try
+                {
+                    var innerNodes = ScanContentDependencies(inlineBlock, seen);
+                    nodes.AddRange(innerNodes);
+                }
+                catch { }
             }
         }
 
@@ -163,7 +233,8 @@ public class ContentTransferService : IContentTransferService
         // Use type-name detection + PropertyLongString.LongString to get the raw stored XHTML
         // without requiring an HTTP context (which XhtmlString.ToHtmlString() may need).
         var seenInlineUrls = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        _logger.LogDebug("Pre-check XHTML scan for '{Content}': scanning {Count} properties", content.Name, contentData.Property.Count);
+        var contentName = (contentData as IContent)?.Name ?? "inline block";
+        _logger.LogDebug("Pre-check XHTML scan for '{Content}': scanning {Count} properties", contentName, contentData.Property.Count);
         foreach (var prop in contentData.Property)
         {
             var typeName = prop.GetType().Name;
@@ -188,10 +259,10 @@ public class ContentTransferService : IContentTransferService
             }
             catch (Exception ex)
             {
-                _logger.LogDebug("Pre-check XHTML read failed for '{Content}'.{Prop}({Type}): {Error}", content.Name, prop.Name, typeName, ex.Message);
+                _logger.LogDebug("Pre-check XHTML read failed for '{Content}'.{Prop}({Type}): {Error}", contentName, prop.Name, typeName, ex.Message);
             }
 
-            _logger.LogDebug("Pre-check XHTML prop '{Content}'.{Prop}({Type}): {Len} chars", content.Name, prop.Name, typeName, html?.Length ?? -1);
+            _logger.LogDebug("Pre-check XHTML prop '{Content}'.{Prop}({Type}): {Len} chars", contentName, prop.Name, typeName, html?.Length ?? -1);
             if (string.IsNullOrEmpty(html)) continue;
 
             foreach (Match m in Regex.Matches(html, @"src=""([^""]+)""", RegexOptions.IgnoreCase))
@@ -232,27 +303,40 @@ public class ContentTransferService : IContentTransferService
 
     private async Task<PreCheckItemResult> BuildPreCheckItemAsync(
         ContentReference contentRef,
+        IContent content,
+        Guid? directParentSourceGuid,
+        string directParentName,
+        List<(IContent ancestor, string url)> ancestorsWithUrls,
+        Guid? siteRootGuid,
+        string siteRootPath,
         DxpEnvironmentConfig target,
         string targetToken,
         bool overwriteMatchingIds,
-        Dictionary<Guid, Guid> batchGuidMap)
+        Dictionary<Guid, Guid> batchGuidMap,
+        HashSet<Guid> batchForcedNew)
     {
-        IContent content;
-        try { content = _contentLoader.Get<IContent>(contentRef); }
-        catch (Exception ex)
+        if (content == null)
         {
             return new PreCheckItemResult
             {
                 ContentId = contentRef.ToString(),
                 ContentName = "?",
                 Action = PreCheckAction.Unresolvable,
-                Notes = $"Could not load source content: {ex.Message}"
+                Notes = "Could not load source content."
             };
         }
 
         var guid = content.ContentGuid;
         var name = content.Name;
+
+        // All IContentLoader/IUrlResolver data was pre-loaded by the caller — safe to await immediately.
         var existsOnTarget = await ExistsOnTargetAsync(guid, target, targetToken);
+
+        // If the direct parent is in the batch and is being created fresh (not overwritten in-place),
+        // this item cannot exist on the target in the correct context — even if its GUID matches
+        // something elsewhere. Treat it as new so it gets created under its proper parent.
+        if (existsOnTarget && directParentSourceGuid.HasValue && batchForcedNew.Contains(directParentSourceGuid.Value))
+            existsOnTarget = false;
 
         if (existsOnTarget && overwriteMatchingIds)
         {
@@ -266,36 +350,26 @@ public class ContentTransferService : IContentTransferService
             };
         }
 
-        // For CreateNew (exists but not overwriting) or Create (doesn't exist), resolve parent.
         // Check the batch first: if the direct parent is also being transferred we know its target GUID
         // without needing it to exist on target yet.
         Guid? parentGuid = null;
         string parentPath = null;
-        Guid? directParentSourceGuid = null;
-        if (!ContentReference.IsNullOrEmpty(content.ParentLink))
-        {
-            try { directParentSourceGuid = _contentLoader.Get<IContent>(content.ParentLink).ContentGuid; }
-            catch { /* parent may not be loadable */ }
-        }
 
         if (directParentSourceGuid.HasValue && batchGuidMap.TryGetValue(directParentSourceGuid.Value, out var batchParentTargetGuid))
         {
             parentGuid = batchParentTargetGuid;
-            try { parentPath = _contentLoader.Get<IContent>(content.ParentLink).Name + " (being transferred)"; }
-            catch { parentPath = "(parent being transferred)"; }
+            parentPath = (directParentName ?? "(parent being transferred)") + " (being transferred)";
         }
         else
         {
-            (parentGuid, parentPath) = await ResolveTargetParentAsync(content, target, targetToken);
+            (parentGuid, parentPath) = await ResolveTargetParentAsync(ancestorsWithUrls, target, targetToken);
         }
 
-        // If parent not resolved by batch or GUID/URL walking, fall back to the site start page
         var usedRootFallback = false;
         if (!parentGuid.HasValue)
         {
-            var (rootGuid, rootPath) = GetSiteRootFallback();
-            parentGuid = rootGuid;
-            parentPath = rootPath;
+            parentGuid = siteRootGuid;
+            parentPath = siteRootPath;
             usedRootFallback = true;
         }
 
@@ -357,36 +431,29 @@ public class ContentTransferService : IContentTransferService
     }
 
     private async Task<(Guid? guid, string path)> ResolveTargetParentAsync(
-        IContent content,
+        List<(IContent ancestor, string url)> ancestorsWithUrls,
         DxpEnvironmentConfig target,
         string targetToken)
     {
-        var ancestors = BuildAncestorChain(content.ParentLink);
-
         // Phase 1: GUID-based — walk up source ancestry, return first that exists on target
-        foreach (var ancestor in ancestors)
+        foreach (var (ancestor, _) in ancestorsWithUrls)
         {
             if (ancestor.ContentGuid == Guid.Empty) continue;
             if (await ExistsOnTargetAsync(ancestor.ContentGuid, target, targetToken))
                 return (ancestor.ContentGuid, ancestor.Name);
         }
 
-        // Phase 2: URL-based — resolve each ancestor's friendly URL and search on target
-        foreach (var ancestor in ancestors)
+        // Phase 2: URL-based — URLs were pre-computed by the caller before any await
+        foreach (var (ancestor, relativeUrl) in ancestorsWithUrls)
         {
-            try
-            {
-                var relativeUrl = _urlResolver.GetUrl(ancestor.ContentLink);
-                if (string.IsNullOrWhiteSpace(relativeUrl) ||
-                    relativeUrl == "/" ||
-                    relativeUrl.StartsWith("http", StringComparison.OrdinalIgnoreCase))
-                    continue;
+            if (string.IsNullOrWhiteSpace(relativeUrl) ||
+                relativeUrl == "/" ||
+                relativeUrl.StartsWith("http", StringComparison.OrdinalIgnoreCase))
+                continue;
 
-                var targetGuid = await FindByUrlOnTargetAsync(relativeUrl, target, targetToken);
-                if (targetGuid.HasValue)
-                    return (targetGuid, $"{ancestor.Name} (matched by URL '{relativeUrl}')");
-            }
-            catch { /* URL resolution may not be supported for blocks/media */ }
+            var targetGuid = await FindByUrlOnTargetAsync(relativeUrl, target, targetToken);
+            if (targetGuid.HasValue)
+                return (targetGuid, $"{ancestor.Name} (matched by URL '{relativeUrl}')");
         }
 
         return (null, null);
@@ -404,7 +471,7 @@ public class ContentTransferService : IContentTransferService
         {
             try
             {
-                var ancestor = _contentLoader.Get<IContent>(current);
+                var ancestor = _contentLoader.Get<IContent>(current, LanguageSelector.AutoDetect(true));
                 chain.Add(ancestor);
                 current = ancestor.ParentLink;
             }
@@ -465,6 +532,45 @@ public class ContentTransferService : IContentTransferService
         if (source == null || !source.IsConfigured)
             return new TransferResult { Success = false, ErrorMessage = $"Source environment '{sourceEnvironmentName}' is not configured. Ensure credentials are saved in settings." };
 
+        var contentRef = ParseContentReference(contentId);
+        if (contentRef == ContentReference.EmptyReference)
+            return new TransferResult { Success = false, ErrorMessage = $"Invalid content reference: {contentId}" };
+
+        // Pre-load ALL IContentLoader/IUrlResolver data synchronously BEFORE the first await.
+        var itemContexts = CollectItems(contentRef, includeChildren)
+            .Select(itemRef =>
+            {
+                IContent content = null;
+                try { content = _contentLoader.Get<IContent>(itemRef, LanguageSelector.AutoDetect(true)); }
+                catch { }
+
+                string contentName = null;
+                Guid sourceGuid = Guid.Empty;
+                int? sortIndex = null;
+                var ancestorsWithUrls = new List<(IContent ancestor, string url)>();
+
+                if (content != null)
+                {
+                    contentName = content.Name;
+                    sourceGuid = content.ContentGuid;
+
+                    var psiVal = content.Property["PageSortIndex"]?.Value;
+                    if (psiVal != null) try { sortIndex = Convert.ToInt32(psiVal); } catch { }
+
+                    foreach (var a in BuildAncestorChain(content.ParentLink))
+                    {
+                        string url = null;
+                        try { url = _urlResolver.GetUrl(a.ContentLink); }
+                        catch { }
+                        ancestorsWithUrls.Add((a, url));
+                    }
+                }
+
+                return (itemRef, content, contentName, sourceGuid, sortIndex, ancestorsWithUrls);
+            })
+            .ToList(); // sortIndex is int? — null means "could not read", 0 is a valid explicit value
+
+        // All IContentLoader work done — now safe to await.
         string targetToken;
         try { targetToken = await _tokenService.GetTokenAsync(target); }
         catch (Exception ex) { return new TransferResult { Success = false, ErrorMessage = $"Failed to authenticate with target environment: {ex.Message}" }; }
@@ -473,23 +579,126 @@ public class ContentTransferService : IContentTransferService
         try { sourceToken = await _tokenService.GetTokenAsync(source); }
         catch (Exception ex) { return new TransferResult { Success = false, ErrorMessage = $"Failed to authenticate with source environment: {ex.Message}" }; }
 
-        var contentRef = ParseContentReference(contentId);
-        if (contentRef == ContentReference.EmptyReference)
-            return new TransferResult { Success = false, ErrorMessage = $"Invalid content reference: {contentId}" };
-
-        // Index plan by contentId for O(1) lookup per item
         var planLookup = plan?.ToDictionary(p => p.ContentId, StringComparer.OrdinalIgnoreCase)
                          ?? new Dictionary<string, PreCheckItemResult>();
 
         var result = new TransferResult { Success = true };
 
-        foreach (var itemRef in CollectItems(contentRef, includeChildren))
+        var deferredPatches = new List<(Guid guid, string property, string json)>();
+
+        foreach (var ctx in itemContexts)
         {
-            planLookup.TryGetValue(itemRef.ToString(), out var planItem);
-            var itemResult = await TransferSingleItemAsync(itemRef, source.BaseUrl, sourceToken, target, targetToken, planItem, transferStatus, onItemComplete);
+            planLookup.TryGetValue(ctx.itemRef.ToString(), out var planItem);
+            var itemResult = await TransferSingleItemAsync(
+                ctx.itemRef, ctx.content, ctx.contentName, ctx.sourceGuid,
+                ctx.sortIndex, ctx.ancestorsWithUrls,
+                source.BaseUrl, sourceToken, target, targetToken,
+                planItem, transferStatus, onItemComplete, deferredPatches);
             result.Items.Add(itemResult);
             if (!itemResult.Success)
                 result.Success = false;
+        }
+
+        // Second pass: re-apply any properties that were stripped because the referenced
+        // content did not yet exist on the target when the page was first written.
+        if (deferredPatches.Count > 0)
+        {
+            // Build a map from target GUID → result item so we can annotate defaults used.
+            var targetGuidToResult = new Dictionary<Guid, TransferItemResult>();
+            for (int i = 0; i < itemContexts.Count && i < result.Items.Count; i++)
+            {
+                var ctx = itemContexts[i];
+                var ri = result.Items[i];
+                if (!ri.Success) continue;
+                planLookup.TryGetValue(ctx.itemRef.ToString(), out var pi);
+                var tg = (pi?.Action == PreCheckAction.CreateNew) ? (pi.NewGuid ?? ctx.sourceGuid) : ctx.sourceGuid;
+                if (tg != Guid.Empty) targetGuidToResult[tg] = ri;
+            }
+
+            _logger.LogInformation("Applying {Count} deferred property patch(es) for forward content references", deferredPatches.Count);
+            foreach (var grp in deferredPatches.GroupBy(p => p.guid))
+            {
+                try
+                {
+                    var currentJson = await ReadFromTargetAsync(grp.Key, target, targetToken);
+                    if (currentJson == null)
+                    {
+                        _logger.LogWarning("Deferred patch: could not read {Guid} from target — skipping", grp.Key);
+                        continue;
+                    }
+                    var stripped = StripReadOnlyProperties(currentJson, preserveParentLink: true);
+                    var node = JsonNode.Parse(stripped)?.AsObject();
+                    if (node == null) continue;
+
+                    targetGuidToResult.TryGetValue(grp.Key, out var resultItem);
+                    var defaultsUsed = new List<string>();
+
+                    foreach (var (_, property, json) in grp)
+                    {
+                        // Check if the referenced content now exists on target
+                        var refGuid = ExtractReferencedContentGuid(json);
+                        var refExists = !refGuid.HasValue || await ExistsOnTargetAsync(refGuid.Value, target, targetToken);
+
+                        if (refExists)
+                        {
+                            try
+                            {
+                                // Inject target integer IDs for every GUID in this property so
+                                // Optimizely can resolve the reference. Without the integer id, a
+                                // GUID-only reference fails with InvalidContent even when the
+                                // content exists on target (EPiServer CMA v3 requirement).
+                                var patchJson = json;
+                                var patchGuids = ExtractContentReferenceGuids(json);
+                                if (patchGuids.Count > 0)
+                                {
+                                    var patchIdMap = new Dictionary<Guid, int?>();
+                                    foreach (var rg in patchGuids)
+                                    {
+                                        var tid = await GetTargetContentIdAsync(rg, target, targetToken);
+                                        if (tid.HasValue) patchIdMap[rg] = tid;
+                                    }
+                                    if (patchIdMap.Count > 0)
+                                        patchJson = InjectTargetContentIds(patchJson, patchIdMap);
+                                }
+                                node[property] = JsonNode.Parse(patchJson);
+                            }
+                            catch { _logger.LogWarning("Deferred patch: could not parse property '{Prop}' for {Guid}", property, grp.Key); }
+                        }
+                        else
+                        {
+                            // Referenced content still absent — create an automatic placeholder
+                            var fallbackGuid = await GetFallbackReferenceGuidAsync(
+                                json, refGuid, grp.Key, source.BaseUrl, sourceToken, target, targetToken);
+                            if (!string.IsNullOrEmpty(fallbackGuid))
+                            {
+                                var fallbackNode = BuildFallbackPropertyValue(json, fallbackGuid);
+                                if (fallbackNode != null)
+                                {
+                                    node[property] = fallbackNode;
+                                    defaultsUsed.Add(property);
+                                    _logger.LogDebug("Deferred patch: property '{Prop}' on {Guid} set to placeholder {Fallback}", property, grp.Key, fallbackGuid);
+                                }
+                            }
+                            else
+                            {
+                                _logger.LogWarning("Deferred patch: property '{Prop}' on {Guid} references missing content and no placeholder could be created — skipping", property, grp.Key);
+                            }
+                        }
+                    }
+
+                    var patchedContent = await RelinkContentLinksAsync(node.ToJsonString(), source.BaseUrl, target, targetToken);
+                    patchedContent = ReplaceSourceDomain(patchedContent, source.BaseUrl, target.BaseUrl);
+                    await WriteToTargetAsync(grp.Key, patchedContent, target, targetToken);
+                    _logger.LogInformation("Deferred patch applied for {Guid}: [{Props}]", grp.Key, string.Join(", ", grp.Select(p => p.property)));
+
+                    if (defaultsUsed.Count > 0 && resultItem != null)
+                        resultItem.DefaultedProperties.AddRange(defaultsUsed);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning("Deferred patch failed for {Guid}: {Error}", grp.Key, ex.Message);
+                }
+            }
         }
 
         result.TransferredCount = result.Items.Count(i => i.Success);
@@ -498,23 +707,23 @@ public class ContentTransferService : IContentTransferService
 
     private async Task<TransferItemResult> TransferSingleItemAsync(
         ContentReference contentRef,
+        IContent content,
+        string contentName,
+        Guid sourceGuid,
+        int? sortIndex,
+        List<(IContent ancestor, string url)> ancestorsWithUrls,
         string sourceBaseUrl,
         string sourceToken,
         DxpEnvironmentConfig target,
         string targetToken,
         PreCheckItemResult planItem,
         string transferStatus = "Published",
-        Action onItemComplete = null)
+        Action onItemComplete = null,
+        List<(Guid guid, string property, string json)> deferredPatches = null)
     {
-        IContent content;
-        try { content = _contentLoader.Get<IContent>(contentRef); }
-        catch (Exception ex)
-        {
-            return new TransferItemResult { ContentId = contentRef.ToString(), Success = false, ErrorMessage = $"Could not load content: {ex.Message}" };
-        }
-
-        var contentName = content.Name;
-        var sourceGuid = content.ContentGuid;
+        // content, contentName, sourceGuid, sortIndex, ancestorsWithUrls are all pre-loaded by caller.
+        if (content == null)
+            return new TransferItemResult { ContentId = contentRef.ToString(), Success = false, ErrorMessage = "Could not load content." };
 
         string sourceJson;
         try { sourceJson = await ReadFromSourceAsync(sourceGuid, sourceBaseUrl, sourceToken); }
@@ -541,11 +750,12 @@ public class ContentTransferService : IContentTransferService
         }
         else
         {
-            var (parentGuid, _) = await ResolveTargetParentAsync(content, target, targetToken);
+            var (parentGuid, _) = await ResolveTargetParentAsync(ancestorsWithUrls, target, targetToken);
             targetParentGuid = parentGuid ?? Guid.Empty;
         }
 
         var visited = new HashSet<Guid> { sourceGuid };
+        var failedDependencyGuids = new List<string>();
 
         try
         {
@@ -553,7 +763,7 @@ public class ContentTransferService : IContentTransferService
                 sourceGuid, sourceJson, sourceBaseUrl, sourceToken,
                 target, targetToken, targetGuid, targetParentGuid,
                 (transferStatus == "CheckedOut") ? "CheckedOut" : "Published",
-                visited, onItemComplete);
+                visited, onItemComplete, sortIndex, deferredPatches, failedDependencyGuids);
 
             return new TransferItemResult
             {
@@ -561,13 +771,14 @@ public class ContentTransferService : IContentTransferService
                 ContentName = contentName,
                 Success = true,
                 TargetContentId = targetId,
-                TargetBaseUrl = target.BaseUrl
+                TargetBaseUrl = target.BaseUrl,
+                FailedDependencyGuids = failedDependencyGuids
             };
         }
         catch (Exception ex)
         {
             onItemComplete?.Invoke();
-            return new TransferItemResult { ContentId = contentRef.ToString(), ContentName = contentName, Success = false, ErrorMessage = $"Transfer failed: {ex.Message}" };
+            return new TransferItemResult { ContentId = contentRef.ToString(), ContentName = contentName, Success = false, ErrorMessage = $"Transfer failed: {ex.Message}", FailedDependencyGuids = failedDependencyGuids };
         }
     }
 
@@ -593,7 +804,10 @@ public class ContentTransferService : IContentTransferService
         Guid targetParentGuid,
         string effectiveStatus,
         HashSet<Guid> visited,
-        Action onItemComplete)
+        Action onItemComplete,
+        int? sortIndex = null,
+        List<(Guid guid, string property, string json)> deferredPatches = null,
+        List<string> failedDependencyGuids = null)
     {
         // ── Step 1: Blocks and global media ──────────────────────────────────
         // Process blocks depth-first (they must exist before the parent is written).
@@ -642,8 +856,25 @@ public class ContentTransferService : IContentTransferService
                 }
                 else
                 {
-                    // Global media — parent folder already exists on target
+                    // Global media — ensure its parent folder exists on target before uploading.
+                    // Globalassets folder GUIDs are usually identical across DXP environments, but
+                    // sub-folders may be missing if the folder tree was never fully synced.
                     var mediaParentGuid = ExtractParentGuid(refJson) ?? targetGuid;
+                    if (mediaParentGuid != targetGuid && !await ExistsOnTargetAsync(mediaParentGuid, target, targetToken))
+                    {
+                        // Try to resolve the canonical path and recreate the folder hierarchy
+                        var canonicalUrl = await GetSourceContentUrlAsync(refGuid, sourceBaseUrl, sourceToken);
+                        if (!string.IsNullOrEmpty(canonicalUrl) && canonicalUrl.StartsWith("/globalassets/", StringComparison.OrdinalIgnoreCase))
+                        {
+                            var lastSlash = canonicalUrl.LastIndexOf('/');
+                            var folderPath = lastSlash > 0 ? canonicalUrl[..(lastSlash + 1)] : "/globalassets/";
+                            mediaParentGuid = await EnsureGlobalAssetFolderPathAsync(folderPath, sourceBaseUrl, sourceToken, target, targetToken) ?? targetGuid;
+                        }
+                        else
+                        {
+                            await EnsureContentParentAsync(mediaParentGuid, sourceBaseUrl, sourceToken, target, targetToken, new HashSet<Guid> { refGuid });
+                        }
+                    }
                     var mediaStub = BuildMinimalAssetJson(refJson, mediaParentGuid);
                     try
                     {
@@ -652,6 +883,7 @@ public class ContentTransferService : IContentTransferService
                     catch (Exception ex)
                     {
                         _logger.LogWarning("Could not upload global media {Guid}: {Error}", refGuid, ex.Message);
+                        failedDependencyGuids?.Add(refGuid.ToString("D"));
                         if (await ExistsOnTargetAsync(refGuid, target, targetToken))
                             idMap[refGuid] = await GetTargetContentIdAsync(refGuid, target, targetToken);
                     }
@@ -674,26 +906,21 @@ public class ContentTransferService : IContentTransferService
                     await EnsureContentParentAsync(blockParentGuid, sourceBaseUrl, sourceToken, target, targetToken, new HashSet<Guid> { refGuid });
             }
 
-            if (await ExistsOnTargetAsync(refGuid, target, targetToken))
-            {
-                var existingId = await GetTargetContentIdAsync(refGuid, target, targetToken);
-                if (existingId.HasValue) idMap[refGuid] = existingId;
-                _logger.LogDebug("Block {Guid} already exists on target — using existing ID {Id}", refGuid, existingId);
-                onItemComplete?.Invoke();
-                continue;
-            }
-
+            // Always re-transfer block content (even if the block already exists on target).
+            // Skipping existing blocks means stale data — links, URLs, and property changes
+            // made on source would never propagate. PUT is idempotent in the CMA.
             try
             {
                 idMap[refGuid] = await TransferItemCoreAsync(
                     refGuid, refJson, sourceBaseUrl, sourceToken,
                     target, targetToken,
                     refGuid, blockParentGuid,
-                    effectiveStatus, visited, onItemComplete);
+                    effectiveStatus, visited, onItemComplete, sortIndex: null, deferredPatches, failedDependencyGuids);
             }
             catch (Exception ex)
             {
                 _logger.LogWarning("Could not transfer block {Guid}: {Error}", refGuid, ex.Message);
+                failedDependencyGuids?.Add(refGuid.ToString("D"));
                 if (await ExistsOnTargetAsync(refGuid, target, targetToken))
                     idMap[refGuid] = await GetTargetContentIdAsync(refGuid, target, targetToken);
                 onItemComplete?.Invoke();
@@ -708,9 +935,12 @@ public class ContentTransferService : IContentTransferService
         baseJson = InjectParentLink(baseJson, targetParentGuid);
         if (idMap.Count > 0) baseJson = InjectTargetContentIds(baseJson, idMap);
         baseJson = InjectStatus(baseJson, effectiveStatus);
-        baseJson = InjectSortIndex(sourceJson, baseJson);
+        // Resolve link-property hrefs to their correct target URLs before the generic domain swap,
+        // because path prefixes (e.g. /mattpage/) can differ between environments.
+        baseJson = await RelinkContentLinksAsync(baseJson, sourceBaseUrl, target, targetToken);
+        baseJson = ReplaceSourceDomain(baseJson, sourceBaseUrl, target.BaseUrl);
 
-        await WriteToTargetAsync(targetGuid, baseJson, target, targetToken);
+        await WriteToTargetAsync(targetGuid, baseJson, target, targetToken, deferredPatches, sourceBaseUrl, sourceToken);
 
         // ── Step 3: Local media + XHTML inline images ─────────────────────────
         // Asset bucket now exists. Upload deferred local media, then XHTML inline images.
@@ -731,6 +961,7 @@ public class ContentTransferService : IContentTransferService
             catch (Exception ex)
             {
                 _logger.LogWarning("Could not upload local media {Guid}: {Error}", refGuid, ex.Message);
+                failedDependencyGuids?.Add(refGuid.ToString("D"));
                 if (await ExistsOnTargetAsync(refGuid, target, targetToken))
                     postIdMap[refGuid] = await GetTargetContentIdAsync(refGuid, target, targetToken);
             }
@@ -822,6 +1053,7 @@ public class ContentTransferService : IContentTransferService
             catch (Exception ex)
             {
                 _logger.LogWarning("Could not upload XHTML image {Guid}: {Error}", imageGuid.Value, ex.Message);
+                failedDependencyGuids?.Add(imageGuid.Value.ToString("D"));
                 onItemComplete?.Invoke();
             }
         }
@@ -833,7 +1065,7 @@ public class ContentTransferService : IContentTransferService
             var patchedJson = baseJson;
             if (postIdMap.Count > 0) patchedJson = InjectTargetContentIds(patchedJson, postIdMap);
             if (xhtmlUrlMap.Count > 0) patchedJson = RewriteXhtmlUrls(patchedJson, sourceBaseUrl, xhtmlUrlMap);
-            var result = await WriteToTargetAsync(targetGuid, patchedJson, target, targetToken);
+            var result = await WriteToTargetAsync(targetGuid, patchedJson, target, targetToken, deferredPatches, sourceBaseUrl, sourceToken);
             onItemComplete?.Invoke();
             return result;
         }
@@ -857,8 +1089,26 @@ public class ContentTransferService : IContentTransferService
 
             if (includeChildren)
             {
-                foreach (var child in _contentLoader.GetChildren<IContent>(current).OrderBy(c => c.ContentLink.ID))
-                    queue.Enqueue(child.ContentLink);
+                // Custom page types from external assemblies may not be registered in this project.
+                // Optimizely falls back to loading them as ContentData rather than PageData, so
+                // .OfType<PageData>() silently discards them. Exclude known non-page types instead.
+                using var e = _contentLoader.GetChildren<IContent>(current, LanguageSelector.AutoDetect(true)).GetEnumerator();
+                var pageChildren = new List<(ContentReference contentRef, int sortIndex)>();
+                while (true)
+                {
+                    bool moved;
+                    IContent child = null;
+                    try { moved = e.MoveNext(); if (moved) child = e.Current; }
+                    catch { break; }
+                    if (!moved) break;
+                    if (child is BlockData || child is IContentMedia || child is ContentFolder) continue;
+                    if (child is IVersionable versionable && versionable.Status != VersionStatus.Published) continue;
+                    var sortIdx = 0;
+                    try { var psi = child.Property["PageSortIndex"]?.Value; if (psi != null) sortIdx = Convert.ToInt32(psi); } catch { }
+                    pageChildren.Add((child.ContentLink, sortIdx));
+                }
+                foreach (var (childRef, _) in pageChildren.OrderBy(t => t.sortIndex))
+                    queue.Enqueue(childRef);
             }
         }
 
@@ -969,34 +1219,16 @@ public class ContentTransferService : IContentTransferService
         return node.ToJsonString();
     }
 
-    // Reads SortIndex from the local CMS (via the content ID in the source JSON) and injects
-    // it into the PUT body. The CMA GET response does not include sortIndex so it must be added
-    // explicitly; the CMA PUT then applies it to the created/updated item.
-    private string InjectSortIndex(string sourceJson, string json)
+    // Injects a pre-extracted sort index into the PUT body.
+    // Sort index is read synchronously from IContentLoader before any awaits in the caller.
+    private static string InjectSortIndex(string json, int? sortIndex)
     {
+        if (!sortIndex.HasValue) return json;
         try
         {
-            using var doc = JsonDocument.Parse(sourceJson);
-            if (!doc.RootElement.TryGetProperty("contentLink", out var cl)) return json;
-            if (!cl.TryGetProperty("id", out var idProp) || idProp.ValueKind != JsonValueKind.Number) return json;
-            var content = _contentLoader.Get<IContent>(new ContentReference(idProp.GetInt32()));
-
-            // PageSortIndex is the built-in EPiServer property name for the sort index.
-            // Fall back to reflection (SortIndex C# property) for types that expose it directly.
-            int sortVal = 0;
-            if (content.Property["PageSortIndex"]?.Value is int psi)
-                sortVal = psi;
-            if (sortVal == 0)
-            {
-                var prop = content.GetType().GetProperty("SortIndex");
-                if (prop?.PropertyType == typeof(int) && prop.GetValue(content) is int si)
-                    sortVal = si;
-            }
-            if (sortVal == 0) return json;
-
             var node = JsonNode.Parse(json)?.AsObject();
             if (node == null) return json;
-            node["sortIndex"] = sortVal;
+            node["sortIndex"] = sortIndex.Value;
             return node.ToJsonString();
         }
         catch { }
@@ -1356,6 +1588,178 @@ public class ContentTransferService : IContentTransferService
         }
     }
 
+    // Replaces the source environment origin (scheme+host) with the target origin in every
+    // string value throughout the JSON document. Handles plain URL properties (PropertyUrl,
+    // PropertyLongString containing links) as well as any other field that may store an
+    // absolute URL pointing back at the source environment.
+    private static string ReplaceSourceDomain(string json, string sourceBaseUrl, string targetBaseUrl)
+    {
+        try
+        {
+            var sourceOrigin = new Uri(sourceBaseUrl).GetLeftPart(UriPartial.Authority);
+            var targetOrigin = new Uri(targetBaseUrl).GetLeftPart(UriPartial.Authority);
+            if (string.IsNullOrEmpty(sourceOrigin) ||
+                string.Equals(sourceOrigin, targetOrigin, StringComparison.OrdinalIgnoreCase))
+                return json;
+            var node = JsonNode.Parse(json)?.AsObject();
+            if (node == null) return json;
+            ReplaceOriginInNodes(node, sourceOrigin, targetOrigin);
+            return node.ToJsonString();
+        }
+        catch { return json; }
+    }
+
+    private static void ReplaceOriginInNodes(JsonNode node, string sourceOrigin, string targetOrigin)
+    {
+        if (node is JsonObject obj)
+        {
+            foreach (var key in obj.Select(kvp => kvp.Key).ToList())
+            {
+                var child = obj[key];
+                if (child is JsonValue val && val.TryGetValue(out string str) &&
+                    !string.IsNullOrEmpty(str) &&
+                    str.Contains(sourceOrigin, StringComparison.OrdinalIgnoreCase))
+                {
+                    obj[key] = str.Replace(sourceOrigin, targetOrigin, StringComparison.OrdinalIgnoreCase);
+                }
+                else if (child is JsonObject || child is JsonArray)
+                {
+                    ReplaceOriginInNodes(child, sourceOrigin, targetOrigin);
+                }
+            }
+        }
+        else if (node is JsonArray arr)
+        {
+            for (int i = 0; i < arr.Count; i++)
+            {
+                var item = arr[i];
+                if (item is JsonValue val && val.TryGetValue(out string str) &&
+                    !string.IsNullOrEmpty(str) &&
+                    str.Contains(sourceOrigin, StringComparison.OrdinalIgnoreCase))
+                {
+                    arr[i] = str.Replace(sourceOrigin, targetOrigin, StringComparison.OrdinalIgnoreCase);
+                }
+                else if (item is JsonObject || item is JsonArray)
+                {
+                    ReplaceOriginInNodes(item, sourceOrigin, targetOrigin);
+                }
+            }
+        }
+    }
+
+    // Resolves internal link URLs in PropertyLinkCollection items and PropertyUrl properties
+    // to their correct target-environment URLs. Simple domain replacement is not sufficient
+    // because source environments can have path prefixes (e.g. /mattpage/) that don't exist
+    // on target. For each href/value containing the source origin we:
+    //   1. Look up the page by its contentLink.guidValue via the target CDV (most reliable).
+    //   2. Fall back to finding the page by its source URL path on target.
+    //   3. Last resort: plain domain swap.
+    // Must be called before ReplaceSourceDomain so the source origin is still detectable.
+    private async Task<string> RelinkContentLinksAsync(
+        string json,
+        string sourceBaseUrl,
+        DxpEnvironmentConfig target,
+        string targetToken)
+    {
+        try
+        {
+            var sourceOrigin = new Uri(sourceBaseUrl).GetLeftPart(UriPartial.Authority);
+            var targetOrigin = new Uri(target.BaseUrl).GetLeftPart(UriPartial.Authority);
+            if (string.IsNullOrEmpty(sourceOrigin) ||
+                string.Equals(sourceOrigin, targetOrigin, StringComparison.OrdinalIgnoreCase))
+                return json;
+            var node = JsonNode.Parse(json)?.AsObject();
+            if (node == null) return json;
+            await RelinkUrlsInNodeAsync(node, sourceOrigin, targetOrigin, target, targetToken);
+            return node.ToJsonString();
+        }
+        catch { return json; }
+    }
+
+    private async Task RelinkUrlsInNodeAsync(
+        JsonNode node,
+        string sourceOrigin,
+        string targetOrigin,
+        DxpEnvironmentConfig target,
+        string targetToken)
+    {
+        if (node is JsonObject obj)
+        {
+            // PropertyLinkCollection item: object with an "href" string containing the source origin
+            if (obj["href"] is JsonValue hrefVal && hrefVal.TryGetValue(out string href) &&
+                !string.IsNullOrEmpty(href) &&
+                href.Contains(sourceOrigin, StringComparison.OrdinalIgnoreCase))
+            {
+                obj["href"] = await ResolveToTargetUrlAsync(
+                    href, obj["contentLink"] as JsonObject, sourceOrigin, targetOrigin, target, targetToken);
+            }
+
+            // PropertyUrl: { "value": "https://source/...", "propertyDataType": "PropertyUrl" }
+            if (obj["propertyDataType"] is JsonValue pdtVal &&
+                string.Equals(pdtVal.GetValue<string>(), "PropertyUrl", StringComparison.OrdinalIgnoreCase) &&
+                obj["value"] is JsonValue urlVal && urlVal.TryGetValue(out string urlStr) &&
+                !string.IsNullOrEmpty(urlStr) &&
+                urlStr.Contains(sourceOrigin, StringComparison.OrdinalIgnoreCase))
+            {
+                obj["value"] = await ResolveToTargetUrlAsync(
+                    urlStr, null, sourceOrigin, targetOrigin, target, targetToken);
+            }
+
+            foreach (var child in obj.Select(kvp => kvp.Value).ToList())
+                if (child != null) await RelinkUrlsInNodeAsync(child, sourceOrigin, targetOrigin, target, targetToken);
+        }
+        else if (node is JsonArray arr)
+        {
+            foreach (var item in arr)
+                if (item != null) await RelinkUrlsInNodeAsync(item, sourceOrigin, targetOrigin, target, targetToken);
+        }
+    }
+
+    // Resolves a single source URL to its correct target URL.
+    // Priority: GUID lookup → path lookup on target → domain swap.
+    private async Task<string> ResolveToTargetUrlAsync(
+        string sourceUrl,
+        JsonObject contentLinkNode,
+        string sourceOrigin,
+        string targetOrigin,
+        DxpEnvironmentConfig target,
+        string targetToken)
+    {
+        // 1. GUID-based CDV lookup — survives URL-segment differences between environments
+        if (contentLinkNode != null &&
+            Guid.TryParse(contentLinkNode["guidValue"]?.GetValue<string>(), out var linkedGuid))
+        {
+            var targetUrl = await GetTargetContentUrlViaCdvAsync(linkedGuid, target, targetToken);
+            if (!string.IsNullOrEmpty(targetUrl))
+            {
+                var result = targetUrl.StartsWith('/') ? targetOrigin + targetUrl : targetUrl;
+                _logger.LogDebug("Relinked (GUID): {Src} → {Tgt}", sourceUrl, result);
+                return result;
+            }
+        }
+
+        // 2. URL-path lookup on target
+        var relPath = Uri.TryCreate(sourceUrl, UriKind.Absolute, out var srcUri)
+            ? srcUri.PathAndQuery : null;
+        if (!string.IsNullOrEmpty(relPath) && relPath != "/")
+        {
+            var foundGuid = await FindByUrlOnTargetAsync(relPath, target, targetToken);
+            if (foundGuid.HasValue)
+            {
+                var targetUrl = await GetTargetContentUrlViaCdvAsync(foundGuid.Value, target, targetToken);
+                if (!string.IsNullOrEmpty(targetUrl))
+                {
+                    var result = targetUrl.StartsWith('/') ? targetOrigin + targetUrl : targetUrl;
+                    _logger.LogDebug("Relinked (URL path): {Src} → {Tgt}", sourceUrl, result);
+                    return result;
+                }
+            }
+        }
+
+        // 3. Domain swap only — path may still be wrong but at least the origin is correct
+        return sourceUrl.Replace(sourceOrigin, targetOrigin, StringComparison.OrdinalIgnoreCase);
+    }
+
     // Strips the source environment origin (scheme+host) from all image src URLs inside
     // PropertyXhtmlString values so that relative paths (/contentassets/... /globalassets/...)
     // resolve correctly on any target environment.
@@ -1541,6 +1945,32 @@ public class ContentTransferService : IContentTransferService
                 }
             }
 
+            if (response.StatusCode == System.Net.HttpStatusCode.Conflict)
+            {
+                // Asset already exists on target under a different parent — use the existing version.
+                _logger.LogDebug("Asset {Guid} already exists on target with a different parent (InvalidParent) — reusing existing", guid);
+                var existingId = await GetTargetContentIdAsync(guid, target, targetToken);
+                string existingUrl = null;
+                var existingJson = await ReadFromTargetAsync(guid, target, targetToken);
+                if (existingJson != null)
+                {
+                    try
+                    {
+                        using var doc = JsonDocument.Parse(existingJson);
+                        if (doc.RootElement.TryGetProperty("url", out var urlProp) &&
+                            urlProp.ValueKind == JsonValueKind.String)
+                        {
+                            var fullUrl = urlProp.GetString() ?? "";
+                            existingUrl = Uri.TryCreate(fullUrl, UriKind.Absolute, out var uri)
+                                ? uri.PathAndQuery
+                                : (fullUrl.StartsWith('/') ? fullUrl : null);
+                        }
+                    }
+                    catch { }
+                }
+                return (existingId, existingUrl);
+            }
+
             throw new HttpRequestException($"HTTP {(int)response.StatusCode}: {responseBody}");
         }
 
@@ -1597,6 +2027,38 @@ public class ContentTransferService : IContentTransferService
         }
     }
 
+    // Filters out CMS system pages (Root=1, Waste Basket=2) that are never meaningful
+    // user content and should not appear in the dependency plan.
+    private static bool IsSystemContentReference(ContentReference contentRef) =>
+        !ContentReference.IsNullOrEmpty(contentRef) &&
+        (contentRef.ID == ContentReference.RootPage.ID ||
+         contentRef.ID == ContentReference.WasteBasket.ID);
+
+    // Filters out Optimizely built-in PropertyContentReference properties that hold
+    // structural/navigational links (parent, shortcut target, archive location) rather
+    // than user-created content dependencies.
+    private static readonly HashSet<string> SystemPropertyNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "PageParentLink", "PageShortcutLink", "PageArchiveLink", "PageDeletedLink"
+    };
+
+    private static bool IsSystemPropertyName(string propName) =>
+        !string.IsNullOrEmpty(propName) && SystemPropertyNames.Contains(propName);
+
+    private static string GetMediaNodeType(string name)
+    {
+        var ext = Path.GetExtension(name ?? "").TrimStart('.').ToLowerInvariant();
+        if (ext is "jpg" or "jpeg" or "png" or "gif" or "bmp" or "webp" or "svg" or "ico" or "tiff" or "tif" or "heic" or "heif" or "avif")
+            return "Image";
+        if (ext is "mp4" or "mov" or "avi" or "mkv" or "wmv" or "flv" or "webm" or "m4v" or "mpg" or "mpeg" or "m2v" or "3gp" or "3g2" or "ogv" or "mts" or "m2ts")
+            return "Video";
+        if (ext is "mp3" or "wav" or "ogg" or "flac" or "aac" or "m4a" or "wma" or "opus" or "aiff" or "mid" or "midi")
+            return "Audio";
+        if (ext is "pdf" or "doc" or "docx" or "xls" or "xlsx" or "ppt" or "pptx" or "odt" or "ods" or "odp" or "rtf" or "txt" or "csv" or "pages" or "numbers" or "keynote" or "epub")
+            return "Document";
+        return "UnknownMedia";
+    }
+
     private static Guid? ExtractParentGuid(string json)
     {
         try
@@ -1629,6 +2091,178 @@ public class ContentTransferService : IContentTransferService
         }
         catch { }
         return null;
+    }
+
+    // Detects {"code":"InvalidContent","detail":"Property 'X' is required."} errors and
+    // returns the property name so the caller can strip it and defer it for a second pass.
+    private static string ExtractInvalidContentPropertyName(string errorBody)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(errorBody);
+            var root = doc.RootElement;
+            if (!root.TryGetProperty("code", out var code) ||
+                !string.Equals(code.GetString(), "InvalidContent", StringComparison.OrdinalIgnoreCase))
+                return null;
+            if (!root.TryGetProperty("detail", out var detail)) return null;
+            var msg = detail.GetString() ?? "";
+            var start = msg.IndexOf('\'') + 1;
+            var end = msg.IndexOf('\'', start);
+            if (start > 0 && end > start) return msg[start..end];
+        }
+        catch { }
+        return null;
+    }
+
+    // Returns the first content GUID referenced inside a CMA property value node,
+    // so the deferred-patch pass can check whether that content now exists on the target.
+    private static Guid? ExtractReferencedContentGuid(string propertyJson)
+    {
+        try
+        {
+            var node = JsonNode.Parse(propertyJson)?.AsObject();
+            if (node == null) return null;
+            // PropertyContentReference: { value: { guidValue: "..." } }
+            if (node["value"] is JsonObject val)
+            {
+                if (Guid.TryParse(val["guidValue"]?.GetValue<string>(), out var g)) return g;
+            }
+            // PropertyContentArea: { value: [ { contentLink: { guidValue: "..." } } ] }
+            if (node["value"] is JsonArray arr && arr.Count > 0)
+            {
+                var cl = arr[0]?.AsObject()?["contentLink"]?.AsObject();
+                if (cl != null && Guid.TryParse(cl["guidValue"]?.GetValue<string>(), out var g2)) return g2;
+            }
+        }
+        catch { }
+        return null;
+    }
+
+    // Returns a fallback GUID for a property whose referenced content doesn't exist on the target.
+    // Page references → start page GUID (same across all environments in DXP).
+    // Block/media references → a PLACEHOLDER copy created in the target page's asset folder.
+    private async Task<string> GetFallbackReferenceGuidAsync(
+        string propertyJson,
+        Guid? sourceRefGuid,
+        Guid pageTargetGuid,
+        string sourceBaseUrl,
+        string sourceToken,
+        DxpEnvironmentConfig target,
+        string targetToken)
+    {
+        // Determine whether the referenced content is a page
+        bool isPage = false;
+        if (sourceRefGuid.HasValue)
+        {
+            try
+            {
+                var srcJson = await ReadFromSourceAsync(sourceRefGuid.Value, sourceBaseUrl, sourceToken);
+                using var doc = JsonDocument.Parse(srcJson);
+                isPage = IsPageContent(doc.RootElement);
+            }
+            catch { }
+        }
+        else
+        {
+            // Fall back to property data type
+            try
+            {
+                var pdt = JsonNode.Parse(propertyJson)?.AsObject()?["propertyDataType"]?.GetValue<string>();
+                isPage = pdt == "PropertyContentReference";
+            }
+            catch { }
+        }
+
+        if (isPage)
+        {
+            // Use the site start page — its GUID is identical on all DXP environments
+            var (startGuid, _) = GetSiteRootFallback();
+            if (startGuid.HasValue && await ExistsOnTargetAsync(startGuid.Value, target, targetToken))
+                return startGuid.Value.ToString();
+            return null;
+        }
+
+        // Block or media — create a PLACEHOLDER in the target page's asset folder
+        return sourceRefGuid.HasValue
+            ? await CreatePlaceholderAsync(sourceRefGuid.Value, pageTargetGuid, sourceBaseUrl, sourceToken, target, targetToken)
+            : null;
+    }
+
+    // Creates a minimal PLACEHOLDER content item on the target using the source item's content type.
+    private async Task<string> CreatePlaceholderAsync(
+        Guid sourceRefGuid,
+        Guid pageTargetGuid,
+        string sourceBaseUrl,
+        string sourceToken,
+        DxpEnvironmentConfig target,
+        string targetToken)
+    {
+        try
+        {
+            var srcJson = await ReadFromSourceAsync(sourceRefGuid, sourceBaseUrl, sourceToken);
+            string stubJson;
+            using (var doc = JsonDocument.Parse(srcJson))
+            {
+                stubJson = IsMediaContent(doc.RootElement)
+                    ? BuildMinimalAssetJson(srcJson, pageTargetGuid)
+                    : BuildMinimalContentJson(srcJson, pageTargetGuid);
+            }
+
+            var stubNode = JsonNode.Parse(stubJson)?.AsObject();
+            if (stubNode == null) return null;
+            stubNode["name"] = "PLACEHOLDER";
+            stubNode["status"] = "Published";
+
+            var placeholderGuid = Guid.NewGuid();
+            await WriteToTargetAsync(placeholderGuid, stubNode.ToJsonString(), target, targetToken);
+            _logger.LogDebug("Created PLACEHOLDER for missing {SourceGuid} under page {Page}", sourceRefGuid, pageTargetGuid);
+            return placeholderGuid.ToString();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning("Could not create PLACEHOLDER for {SourceGuid}: {Error}", sourceRefGuid, ex.Message);
+            return null;
+        }
+    }
+
+    private static JsonNode BuildFallbackPropertyValue(string propertyJson, string fallbackGuid)
+    {
+        try
+        {
+            var node = JsonNode.Parse(propertyJson)?.AsObject();
+            if (node == null) return null;
+            var pdt = node["propertyDataType"]?.GetValue<string>();
+            if (pdt == "PropertyContentReference")
+                node["value"] = new JsonObject { ["guidValue"] = fallbackGuid };
+            else if (pdt == "PropertyContentArea")
+                node["value"] = new JsonArray { new JsonObject { ["contentLink"] = new JsonObject { ["guidValue"] = fallbackGuid }, ["displayOption"] = "" } };
+            return node;
+        }
+        catch { }
+        return null;
+    }
+
+    private static string ExtractNamedPropertyJson(string json, string propertyName)
+    {
+        try
+        {
+            var node = JsonNode.Parse(json)?.AsObject();
+            if (node != null && node[propertyName] is JsonNode val)
+                return val.ToJsonString();
+        }
+        catch { }
+        return null;
+    }
+
+    private async Task<string> ReadFromTargetAsync(Guid guid, DxpEnvironmentConfig target, string targetToken)
+    {
+        var client = _httpClientFactory.CreateClient();
+        var url = $"{target.BaseUrl.TrimEnd('/')}/api/episerver/v3.0/contentmanagement/{guid}";
+        var request = new HttpRequestMessage(HttpMethod.Get, url);
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", targetToken);
+        var response = await client.SendAsync(request);
+        if (!response.IsSuccessStatusCode) return null;
+        return await response.Content.ReadAsStringAsync();
     }
 
     private static string StripNamedProperty(string json, string propertyName)
@@ -1779,13 +2413,16 @@ public class ContentTransferService : IContentTransferService
         return null;
     }
 
-    private async Task<int?> WriteToTargetAsync(Guid guid, string contentJson, DxpEnvironmentConfig target, string token)
+    private async Task<int?> WriteToTargetAsync(Guid guid, string contentJson, DxpEnvironmentConfig target, string token,
+        List<(Guid guid, string property, string json)> deferredPatches = null,
+        string sourceBaseUrl = null, string sourceToken = null)
     {
         var client = _httpClientFactory.CreateClient();
         var url = $"{target.BaseUrl.TrimEnd('/')}/api/episerver/v3.0/contentmanagement/{guid}";
         var activeJson = contentJson;
+        var strippedProps = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        for (var attempt = 0; attempt < 10; attempt++)
+        for (var attempt = 0; attempt < 25; attempt++)
         {
             LogRequest("PUT", url, token, activeJson);
             var request = new HttpRequestMessage(HttpMethod.Put, url)
@@ -1816,10 +2453,81 @@ public class ContentTransferService : IContentTransferService
                 var unknownProp = ExtractPropertyNotFoundName(body);
                 if (unknownProp != null)
                 {
+                    // If we've already tried stripping this property name and the error
+                    // repeats, the property is nested (not at root level) so StripNamedProperty
+                    // was a no-op. Throw the real error rather than looping indefinitely.
+                    if (!strippedProps.Add(unknownProp))
+                        throw new HttpRequestException($"HTTP {(int)response.StatusCode}: {body}");
+
                     _logger.LogDebug("Stripping unknown property '{Prop}' from {Guid} and retrying", unknownProp, guid);
                     activeJson = StripNamedProperty(activeJson, unknownProp);
                     continue;
                 }
+
+                var requiredProp = ExtractInvalidContentPropertyName(body);
+                if (requiredProp != null)
+                {
+                    var propJson = ExtractNamedPropertyJson(activeJson, requiredProp);
+
+                    // If the property doesn't exist at root level it is nested inside a
+                    // PropertyBlock. StripNamedProperty would be a no-op and we'd loop
+                    // forever — throw the real error instead so the caller gets a clear message.
+                    if (propJson == null)
+                        throw new HttpRequestException($"HTTP {(int)response.StatusCode}: {body}");
+
+                    // If we've already tried this property and still get the same error the
+                    // strip didn't take effect — bail rather than looping.
+                    if (!strippedProps.Add(requiredProp))
+                        throw new HttpRequestException($"HTTP {(int)response.StatusCode}: {body}");
+
+                    // Try to substitute a fallback value so the content can be written.
+                    // Page references → site root; block/media references → placeholder copy.
+                    if (!string.IsNullOrEmpty(sourceBaseUrl) && !string.IsNullOrEmpty(sourceToken))
+                    {
+                        try
+                        {
+                            var sourceRefGuid = ExtractReferencedContentGuid(propJson);
+                            var fallbackGuid = await GetFallbackReferenceGuidAsync(
+                                propJson, sourceRefGuid, guid,
+                                sourceBaseUrl, sourceToken, target, token);
+                            if (!string.IsNullOrEmpty(fallbackGuid))
+                            {
+                                var fallbackNode = BuildFallbackPropertyValue(propJson, fallbackGuid);
+                                if (fallbackNode != null)
+                                {
+                                    var node = JsonNode.Parse(activeJson)?.AsObject();
+                                    if (node != null)
+                                    {
+                                        node[requiredProp] = fallbackNode;
+                                        activeJson = node.ToJsonString();
+                                        _logger.LogDebug("Required property '{Prop}' on {Guid} — substituted fallback {FallbackGuid}", requiredProp, guid, fallbackGuid);
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogWarning("Could not build fallback for required property '{Prop}' on {Guid}: {Error}", requiredProp, guid, ex.Message);
+                        }
+                    }
+
+                    // No fallback available — strip the property and defer for a second pass.
+                    if (deferredPatches != null)
+                    {
+                        deferredPatches.Add((guid, requiredProp, propJson));
+                        _logger.LogDebug("Deferring required property '{Prop}' on {Guid}", requiredProp, guid);
+                    }
+                    activeJson = StripNamedProperty(activeJson, requiredProp);
+                    continue;
+                }
+            }
+
+            if (response.StatusCode == System.Net.HttpStatusCode.Conflict)
+            {
+                // Content already exists on target under a different parent — use the existing version.
+                _logger.LogDebug("{Guid} already exists on target with a different parent (InvalidParent) — reusing existing", guid);
+                return await GetTargetContentIdAsync(guid, target, token);
             }
 
             throw new HttpRequestException($"HTTP {(int)response.StatusCode}: {body}");
@@ -1834,7 +2542,7 @@ public class ContentTransferService : IContentTransferService
         {
             var startRef = SiteDefinition.Current?.StartPage ?? ContentReference.StartPage;
             if (ContentReference.IsNullOrEmpty(startRef)) return (null, null);
-            var startPage = _contentLoader.Get<IContent>(startRef);
+            var startPage = _contentLoader.Get<IContent>(startRef, LanguageSelector.AutoDetect(true));
             return (startPage.ContentGuid, $"{startPage.Name} (site root)");
         }
         catch { return (null, null); }
@@ -1846,7 +2554,7 @@ public class ContentTransferService : IContentTransferService
         {
             var startRef = SiteDefinition.Current?.StartPage ?? ContentReference.StartPage;
             if (ContentReference.IsNullOrEmpty(startRef)) return false;
-            return _contentLoader.Get<IContent>(startRef).ContentGuid == guid;
+            return _contentLoader.Get<IContent>(startRef, LanguageSelector.AutoDetect(true)).ContentGuid == guid;
         }
         catch { return false; }
     }

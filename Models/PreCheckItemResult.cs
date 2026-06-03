@@ -18,5 +18,6 @@ public class DependencyNode
 {
     public string Name { get; set; }
     public string NodeType { get; set; } // "Block" | "Image" | "InlineImage"
+    public string ContentGuid { get; set; }
     public List<DependencyNode> Children { get; set; } = new();
 }

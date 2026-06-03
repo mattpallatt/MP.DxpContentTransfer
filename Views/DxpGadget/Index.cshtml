@@ -63,7 +63,8 @@
         }
         .status-msg { color: #666; font-size: 13px; padding: 16px 0; text-align: center; }
         .plan-summary { font-size: 13px; margin-bottom: 8px; line-height: 2; }
-        .plan-table { width: 100%; border-collapse: collapse; font-size: 12px; margin-bottom: 4px; }
+        .plan-scroll { max-height: 380px; overflow-y: auto; border: 1px solid #e8e8e8; border-radius: 3px; margin-bottom: 6px; }
+        .plan-table { width: 100%; border-collapse: collapse; font-size: 12px; }
         .plan-table th { text-align: left; font-weight: 600; padding: 4px 5px; border-bottom: 1px solid #ddd; background: #f5f5f5; }
         .plan-table td { padding: 4px 5px; border-bottom: 1px solid #eee; word-break: break-word; vertical-align: top; }
         .plan-table th.col-status,
@@ -77,13 +78,35 @@
         .dep-cell { display: flex; align-items: center; justify-content: space-between; }
         .dep-name { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
         .dep-label { font-size: 11px; font-weight: 500; color: #fff; border-radius: 3px; padding: 2px 6px; margin-left: 8px; white-space: nowrap; flex-shrink: 0; }
-        .dep-label-block  { background: #3a7bd5; }
-        .dep-label-image  { background: #e07820; }
-        .dep-label-inline { background: #c06010; }
+        .dep-label-page     { background: #5c6bc0; }
+        .dep-label-block    { background: #3a7bd5; }
+        .dep-label-image    { background: #e07820; }
+        .dep-label-inline   { background: #c06010; }
+        .dep-label-video    { background: #7b1fa2; }
+        .dep-label-audio    { background: #00838f; }
+        .dep-label-document { background: #2e7d32; }
+        .dep-label-unknown  { background: #616161; }
         /* Transfer status indicator */
         .row-status-pending  { color: #ccc; font-size: 20px; }
         .row-status-done     { color: #2e7d32; font-size: 20px; font-weight: 700; }
         .row-status-failed   { color: #c62828; font-size: 20px; font-weight: 700; }
+        /* Expand/collapse toggle */
+        .toggle-arrow {
+            display: inline-block; width: 12px; margin-right: 3px;
+            font-size: 9px; color: #aaa; cursor: pointer;
+            user-select: none; vertical-align: middle; flex-shrink: 0;
+        }
+        .toggle-arrow:hover { color: #555; }
+        .toggle-spacer { display: inline-block; width: 15px; flex-shrink: 0; }
+        .plan-name-toggle { cursor: pointer; }
+        /* Spinner */
+        @@keyframes dxp-spin { to { transform: rotate(360deg); } }
+        .spinner {
+            width: 24px; height: 24px; margin: 10px auto 0;
+            border: 3px solid #e0e0e0; border-top-color: #2973c3;
+            border-radius: 50%;
+            animation: dxp-spin 0.7s linear infinite;
+        }
         .transfer-banner {
             font-size: 12px; color: #555; background: #f5f8ff; border: 1px solid #cde;
             border-radius: 3px; padding: 5px 9px; margin-bottom: 8px; display: none;
@@ -103,6 +126,12 @@ else if (!Model.IsPageContent)
 {
     <div class="warning">
         Select a page in the editor to transfer content.
+    </div>
+}
+else if (!Model.IsPublished)
+{
+    <div class="warning">
+        Content must be published in order to transfer.
     </div>
 }
 else if (!Model.AvailableTargets.Any())
@@ -167,6 +196,7 @@ else
     <!-- ── Checking ──────────────────────────────────────── -->
     <div id="dxp-checking" style="display:none">
         <div class="status-msg">Checking transfer plan on target...</div>
+        <div class="spinner"></div>
     </div>
 
     <!-- ── Plan (also shown during transfer) ────────────── -->
@@ -188,7 +218,21 @@ var dxpTransfer = (function () {
     var contentId = '@Html.Raw(Model.ContentId)';
     var plan = null;
     var pollTimer = null;
-    var planRows = [];   // ordered list of DOM row elements for checkbox tracking
+    var planRows = [];      // flat ordered list for polling: dep rows come before their page row
+    var planItemMeta = []; // [{pageRow, depRows, expanded}] — one entry per plan item
+    var savedPlanItems = null; // snapshot of plan.items for result hierarchy
+    var savedResultData = null;
+    var savedReq = null;
+    var transferStartTime = null;
+    var savedPlanCounts = null;
+    var transferInProgress = false;
+
+    window.addEventListener('beforeunload', function (e) {
+        if (transferInProgress) {
+            e.preventDefault();
+            e.returnValue = '';
+        }
+    });
 
     document.getElementById('dxp-target')?.addEventListener('change', resetResult);
 
@@ -215,12 +259,58 @@ var dxpTransfer = (function () {
         .catch(function (err) { showError('Pre-check request failed: ' + err.message); });
     }
 
+    function computePlanCounts(p) {
+        var counts = { pages: 0, blocks: 0, images: 0, pageRefs: 0, other: 0 };
+        function walkDeps(deps) {
+            (deps || []).forEach(function (d) {
+                switch (d.nodeType) {
+                    case 'Image': case 'InlineImage': counts.images++; break;
+                    case 'Block': counts.blocks++;    break;
+                    case 'Page':  counts.pageRefs++;  break;
+                    default:      counts.other++;     break; // Video, Audio, Document, UnknownMedia
+                }
+                walkDeps(d.children);
+            });
+        }
+        (p.items || []).forEach(function (item) {
+            counts.pages++;
+            walkDeps(item.dependencies);
+        });
+        return counts;
+    }
+
+    function formatDuration(totalSeconds) {
+        if (totalSeconds < 60) return totalSeconds + 's';
+        var mins = Math.floor(totalSeconds / 60), secs = totalSeconds % 60;
+        if (mins < 60) return mins + 'm ' + (secs ? secs + 's' : '');
+        var hrs = Math.floor(mins / 60); mins = mins % 60;
+        return hrs + 'h ' + (mins ? mins + 'm ' : '') + (secs ? secs + 's' : '');
+    }
+
     function confirm() {
         if (!plan) return;
         var jobId = generateId();
         var req = buildRequest();
         req.plan = plan.items;
         req.jobId = jobId;
+
+        savedReq = req;
+        savedPlanCounts = computePlanCounts(plan);
+        savedPlanItems = (plan.items || []).map(function(item) {
+            return {
+                contentId: item.contentId, contentGuid: item.contentGuid,
+                newGuid: item.newGuid, targetParentGuid: item.targetParentGuid,
+                action: item.action, contentName: item.contentName,
+                dependencies: item.dependencies || []
+            };
+        });
+        transferStartTime = Date.now();
+        transferInProgress = true;
+
+        // Scroll plan to top so the first row is visible when transfer starts
+        var planScroll = document.querySelector('.plan-scroll');
+        if (planScroll) planScroll.scrollTop = 0;
+        document.body.scrollTop = 0;
 
         // Switch plan into "transferring" mode — keep rows visible, disable buttons
         document.getElementById('dxp-transfer-banner').style.display = 'block';
@@ -247,6 +337,7 @@ var dxpTransfer = (function () {
     }
 
     function handleTransferResult(data, req) {
+        savedResultData = data;
         var items = data.items || [];
         var failed = items.filter(function (i) { return !i.success; });
         var succeeded = items.filter(function (i) { return i.success; });
@@ -296,14 +387,14 @@ var dxpTransfer = (function () {
                     if (data.done) {
                         stopPolling();
                         plan = null;
+                        checkAllRows(); // mark all remaining rows immediately — don't wait for result fetch
                         fetch('/dxp-content-transfer/api/result/' + jobId)
                             .then(function (r) { return r.json(); })
                             .then(function (result) {
-                                applyRowResults(result);
+                                applyRowResults(result); // override failures: ✓ → ✗
                                 handleTransferResult(result, req);
                             })
                             .catch(function (err) {
-                                checkAllRows();
                                 showError('Could not retrieve transfer result: ' + err.message);
                             });
                     }
@@ -322,7 +413,20 @@ var dxpTransfer = (function () {
 
     function setRowDone(row) {
         var cell = row ? row.querySelector('.row-status-pending') : null;
-        if (cell) { cell.textContent = '✓'; cell.className = 'row-status-done'; }
+        if (cell) { cell.textContent = '✓'; cell.className = 'row-status-done'; scrollRowIntoView(row); }
+    }
+
+    function scrollRowIntoView(row) {
+        if (!row || row.style.display === 'none') return;
+        var container = document.querySelector('.plan-scroll');
+        if (!container) return;
+        var rowTop = row.offsetTop;
+        var rowH = row.offsetHeight;
+        var ctH = container.clientHeight;
+        var cur = container.scrollTop;
+        // Only scroll if the row is not already fully visible
+        if (rowTop >= cur && rowTop + rowH <= cur + ctH) return;
+        container.scrollTop = Math.max(0, rowTop + rowH / 2 - ctH / 2);
     }
 
     function setRowFailed(row) {
@@ -332,14 +436,21 @@ var dxpTransfer = (function () {
 
     function applyRowResults(result) {
         var successMap = {};
+        var failedGuidSet = {};
         (result.items || []).forEach(function (item) {
             if (item.contentId) successMap[item.contentId] = item.success;
+            (item.failedDependencyGuids || []).forEach(function (g) {
+                failedGuidSet[g.toLowerCase()] = true;
+            });
         });
         planRows.forEach(function (row) {
             var cid = row.dataset && row.dataset.contentId;
+            var guid = row.dataset && row.dataset.guid;
             if (cid && cid in successMap) {
                 if (successMap[cid]) setRowDone(row);
                 else setRowFailed(row);
+            } else if (guid && failedGuidSet[guid]) {
+                setRowFailed(row);
             } else {
                 setRowDone(row);
             }
@@ -350,6 +461,7 @@ var dxpTransfer = (function () {
 
     function renderPlan(data) {
         planRows = [];
+        planItemMeta = [];
         var rootFallbackCount = data.items.filter(function(i) { return i.isRootFallback; }).length;
         var html = '<div class="plan-summary">';
         if (data.overwriteCount)    html += '<span class="act-overwrite">&#8635; ' + data.overwriteCount + ' overwrite</span>&nbsp; ';
@@ -358,7 +470,7 @@ var dxpTransfer = (function () {
         if (rootFallbackCount)      html += '<span style="color:#795548">&#9744; ' + rootFallbackCount + ' at root</span>&nbsp; ';
         if (data.unresolvableCount) html += '<span class="act-none">&#10005; ' + data.unresolvableCount + ' cannot transfer</span>';
         html += '</div>';
-        html += '<table class="plan-table"><thead><tr><th>Content</th><th></th><th>Target</th><th class="col-status"></th></tr></thead><tbody id="dxp-plan-tbody"></tbody></table>';
+        html += '<div class="plan-scroll"><table class="plan-table"><thead><tr><th>Content</th><th></th><th>Target</th><th class="col-status"></th></tr></thead><tbody id="dxp-plan-tbody"></tbody></table></div>';
         document.getElementById('dxp-plan-content').innerHTML = html;
 
         var tbody = document.getElementById('dxp-plan-tbody');
@@ -372,52 +484,95 @@ var dxpTransfer = (function () {
             }
             var location = item.action === 0 ? 'In place'
                          : item.targetParentPath ? esc(item.targetParentPath) : '—';
+            var hasDeps = !!(item.dependencies && item.dependencies.length);
+            var toggleHtml = hasDeps
+                ? '<span class="toggle-arrow">&#9654;</span>'
+                : '<span class="toggle-spacer"></span>';
             var tr = document.createElement('tr');
             tr.dataset.contentId = item.contentId || '';
-            tr.innerHTML = '<td><div>' + esc(item.contentName || item.contentId) + '</div>'
+            tr.innerHTML = '<td><div style="display:flex;align-items:flex-start">'
+                + toggleHtml
+                + '<div><div' + (hasDeps ? ' class="plan-name-toggle"' : '') + '>' + esc(item.contentName || item.contentId) + '</div>'
                 + (item.notes ? '<div class="plan-notes">' + esc(item.notes) + '</div>' : '')
-                + '</td>'
+                + '</div></div></td>'
                 + '<td style="text-align:center;font-size:15px;font-weight:700;"><span class="' + cls + '" title="' + tip + '">' + icon + '</span></td>'
                 + '<td>' + location + '</td>'
                 + '<td class="col-status"><span class="row-status-pending">○</span></td>';
             tbody.appendChild(tr);
-            planRows.push(tr);
 
-            if (item.dependencies && item.dependencies.length)
-                renderDepRows(item.dependencies, tbody, 1);
+            // Collect dep rows; start hidden
+            var depRows = [];
+            if (hasDeps) {
+                renderDepRows(item.dependencies, tbody, 1, depRows);
+                depRows.forEach(function(r) { r.style.display = 'none'; });
+            }
+
+            var meta = { pageRow: tr, depRows: depRows, expanded: false };
+            planItemMeta.push(meta);
+
+            // Deps pushed before page row so the page ticks ✓ only after all deps tick ✓
+            depRows.forEach(function(r) { planRows.push(r); });
+            planRows.push(tr);
+        });
+
+        // Toggle expand/collapse on arrow or name click
+        tbody.addEventListener('click', function(e) {
+            var arrow = e.target.closest('.toggle-arrow');
+            var nameTrigger = e.target.closest('.plan-name-toggle');
+            if (!arrow && !nameTrigger) return;
+            var tr = (arrow || nameTrigger).closest('tr');
+            for (var i = 0; i < planItemMeta.length; i++) {
+                if (planItemMeta[i].pageRow !== tr) continue;
+                var meta = planItemMeta[i];
+                meta.expanded = !meta.expanded;
+                meta.depRows.forEach(function(r) { r.style.display = meta.expanded ? '' : 'none'; });
+                arrow.innerHTML = meta.expanded ? '&#9660;' : '&#9654;';
+                break;
+            }
         });
     }
 
-    function renderDepRows(nodes, tbody, depth) {
+    function getDepLabel(nodeType) {
+        switch (nodeType) {
+            case 'Page':         return { text: 'page ref', cls: 'dep-label dep-label-page' };
+            case 'Image':        return { text: 'image',    cls: 'dep-label dep-label-image' };
+            case 'InlineImage':  return { text: 'inline',   cls: 'dep-label dep-label-inline' };
+            case 'Video':        return { text: 'video',    cls: 'dep-label dep-label-video' };
+            case 'Audio':        return { text: 'audio',    cls: 'dep-label dep-label-audio' };
+            case 'Document':     return { text: 'document', cls: 'dep-label dep-label-document' };
+            case 'UnknownMedia': return { text: 'unknown',  cls: 'dep-label dep-label-unknown' };
+            default:             return { text: 'block',    cls: 'dep-label dep-label-block' };
+        }
+    }
+
+    // out: flat array that all created rows (including nested children) are appended to
+    function renderDepRows(nodes, tbody, depth, out) {
         var indent = '';
         for (var i = 0; i < depth; i++) indent += '&nbsp;&nbsp;&nbsp;';
         nodes.forEach(function (node) {
-            var isInline = node.nodeType === 'InlineImage';
-            var isImage  = node.nodeType === 'Image';
-            var labelText = isImage ? 'image' : isInline ? 'inline' : 'block';
-            var labelCls  = isImage || isInline
-                ? (isInline ? 'dep-label dep-label-inline' : 'dep-label dep-label-image')
-                : 'dep-label dep-label-block';
+            var label = getDepLabel(node.nodeType);
             var tr = document.createElement('tr');
             tr.className = 'dep-row';
+            if (node.contentGuid) tr.dataset.guid = node.contentGuid.toLowerCase();
             tr.innerHTML = '<td colspan="3">'
                 + '<div class="dep-cell">'
                 + '<span class="dep-name">' + indent + '&#x21B3; ' + esc(node.name || '') + '</span>'
-                + '<span class="' + labelCls + '">' + labelText + '</span>'
+                + '<span class="' + label.cls + '">' + label.text + '</span>'
                 + '</div>'
                 + '</td>'
                 + '<td class="col-status"><span class="row-status-pending">○</span></td>';
             tbody.appendChild(tr);
-            planRows.push(tr);
+            out.push(tr);
 
             if (node.children && node.children.length)
-                renderDepRows(node.children, tbody, depth + 1);
+                renderDepRows(node.children, tbody, depth + 1, out);
         });
     }
 
     // ── State / UI helpers ──────────────────────────────────
 
     function setState(state) {
+        if (state === 'form' || state === 'done') transferInProgress = false;
         document.getElementById('dxp-form').style.display     = state === 'form'     ? '' : 'none';
         document.getElementById('dxp-checking').style.display = state === 'checking' ? '' : 'none';
         document.getElementById('dxp-plan').style.display     = (state === 'plan' || state === 'transferring') ? '' : 'none';
@@ -441,11 +596,43 @@ var dxpTransfer = (function () {
         var linked = (data.items || []).filter(function (i) { return i.success && i.targetContentId && i.targetBaseUrl; });
         var html = '<strong>Transferred ' + data.transferredCount + ' item(s) to ' + esc(targetEnv)
             + (hasFailures ? ' with ' + failed.length + ' failure(s).' : ' successfully.') + '</strong>';
-        if (linked.length) {
+
+        // Duration
+        if (transferStartTime) {
+            var elapsed = Math.max(0, Math.floor((Date.now() - transferStartTime) / 1000));
+            html += '<div style="margin-top:5px;font-size:12px;color:#555;">Duration: ' + formatDuration(elapsed) + '</div>';
+        }
+
+        // Asset breakdown from plan
+        if (savedPlanCounts) {
+            var parts = [];
+            if (savedPlanCounts.pages)    parts.push(savedPlanCounts.pages    + ' page'     + (savedPlanCounts.pages    !== 1 ? 's' : ''));
+            if (savedPlanCounts.blocks)   parts.push(savedPlanCounts.blocks   + ' block'    + (savedPlanCounts.blocks   !== 1 ? 's' : ''));
+            if (savedPlanCounts.images)   parts.push(savedPlanCounts.images   + ' image'    + (savedPlanCounts.images   !== 1 ? 's' : ''));
+            if (savedPlanCounts.pageRefs) parts.push(savedPlanCounts.pageRefs + ' page ref' + (savedPlanCounts.pageRefs !== 1 ? 's' : ''));
+            if (savedPlanCounts.other)    parts.push(savedPlanCounts.other    + ' other file' + (savedPlanCounts.other  !== 1 ? 's' : ''));
+            if (parts.length)
+                html += '<div style="margin-top:3px;font-size:12px;color:#555;">Included: ' + parts.join(', ') + '</div>';
+        }
+        if (savedPlanItems && savedPlanItems.length) {
+            var roots = buildResultTree(savedPlanItems, data.items || []);
+            html += renderResultTreeHtml(roots, 0);
+        } else if (linked.length) {
             html += '<ul style="margin:8px 0 0;padding-left:18px;">';
             linked.forEach(function (i) {
                 var url = i.targetBaseUrl.replace(/\/$/, '') + '/EPiServer/CMS/#context=epi.cms.contentdata:///' + i.targetContentId;
                 html += '<li><a href="' + esc(url) + '" target="_blank">' + esc(i.contentName || i.contentId) + '</a></li>';
+            });
+            html += '</ul>';
+        }
+        // Defaults warning
+        var defaulted = (data.items || []).filter(function(i) { return i.defaultedProperties && i.defaultedProperties.length; });
+        if (defaulted.length) {
+            html += '<div style="margin-top:8px;font-weight:600;color:#7a5500;">&#9888; Default references used:</div>'
+                + '<ul style="margin:4px 0 0;padding-left:18px;color:#7a5500;font-size:12px;">';
+            defaulted.forEach(function(i) {
+                html += '<li>' + esc(i.contentName || i.contentId) + ': '
+                    + i.defaultedProperties.map(function(p) { return esc(p); }).join(', ') + '</li>';
             });
             html += '</ul>';
         }
@@ -456,9 +643,120 @@ var dxpTransfer = (function () {
             });
             html += '</ul>';
         }
+        html += '<div style="margin-top:10px;">'
+            + '<a href="#" onclick="dxpTransfer.downloadLog();return false;" style="font-size:12px;color:#2973c3;">&#11123; Download transfer log</a>'
+            + '</div>';
         el.className = hasFailures ? 'result partial' : 'result success';
         el.innerHTML = html;
         el.style.display = 'block';
+    }
+
+    function buildResultTree(planItems, resultItems) {
+        var resultById = {};
+        resultItems.forEach(function(r) { resultById[r.contentId] = r; });
+        // Map each item's effective target GUID → its index so children can find their parent
+        var guidToIdx = {};
+        planItems.forEach(function(p, i) {
+            var g = (p.action === 1 && p.newGuid) ? p.newGuid : p.contentGuid;
+            if (g) guidToIdx[g.toLowerCase()] = i;
+        });
+        var nodes = planItems.map(function(p) {
+            return { plan: p, result: resultById[p.contentId] || null, children: [] };
+        });
+        var roots = [];
+        nodes.forEach(function(node) {
+            var pg = node.plan.targetParentGuid;
+            var parentIdx = pg ? guidToIdx[pg.toLowerCase()] : undefined;
+            if (parentIdx !== undefined) nodes[parentIdx].children.push(node);
+            else roots.push(node);
+        });
+        return roots;
+    }
+
+    function renderResultTreeHtml(nodes, depth) {
+        if (!nodes.length) return '';
+        var html = '<ul style="margin:' + (depth === 0 ? '8px' : '3px') + ' 0 0;padding-left:18px;">';
+        nodes.forEach(function(node) {
+            var r = node.result;
+            html += '<li>';
+            if (r && r.success && r.targetContentId && r.targetBaseUrl) {
+                var url = r.targetBaseUrl.replace(/\/$/, '') + '/EPiServer/CMS/#context=epi.cms.contentdata:///' + r.targetContentId;
+                html += '<a href="' + esc(url) + '" target="_blank" style="color:#000;">' + esc(r.contentName || node.plan.contentName || node.plan.contentId) + '</a>';
+            } else {
+                var colour = (r && !r.success) ? '#c62828' : '#888';
+                html += '<span style="color:' + colour + '">' + esc(node.plan.contentName || node.plan.contentId) + '</span>';
+            }
+            if (node.children.length) html += renderResultTreeHtml(node.children, depth + 1);
+            html += '</li>';
+        });
+        return html + '</ul>';
+    }
+
+    function downloadLog() {
+        var lines = ['DXP Content Transfer Log'];
+        lines.push('Date: ' + new Date().toISOString());
+        lines.push('Target: ' + (savedReq ? savedReq.targetEnvironment : '?'));
+        lines.push('');
+
+        function depTypeLabel(nodeType) {
+            switch (nodeType) {
+                case 'Image':        return 'Image';
+                case 'InlineImage':  return 'Inline Image';
+                case 'Video':        return 'Video';
+                case 'Audio':        return 'Audio';
+                case 'Document':     return 'Document';
+                case 'UnknownMedia': return 'Media';
+                case 'Block':        return 'Block';
+                default:             return nodeType || 'Asset';
+            }
+        }
+
+        function col(s, w) { s = String(s); return s + Array(Math.max(1, w - s.length + 1)).join(' '); }
+
+        function writeDeps(deps, indent) {
+            (deps || []).forEach(function(d) {
+                lines.push(col('INCLUDED', 8) + '  ' + indent + col(depTypeLabel(d.nodeType), 14) + '  ' + (d.name || ''));
+                writeDeps(d.children, indent + '  ');
+            });
+        }
+
+        if (savedResultData) {
+            var resultById = {};
+            (savedResultData.items || []).forEach(function(r) { resultById[r.contentId] = r; });
+
+            if (savedPlanItems && savedPlanItems.length) {
+                savedPlanItems.forEach(function(p) {
+                    var r = resultById[p.contentId] || null;
+                    var status = r ? (r.success ? 'OK' : 'FAIL') : '?';
+                    var line = col(status, 8) + '  ' + col('Page', 14) + '  ' + (p.contentName || p.contentId);
+                    if (r && r.errorMessage) line += '  [' + r.errorMessage + ']';
+                    if (r && r.defaultedProperties && r.defaultedProperties.length)
+                        line += '  [defaults: ' + r.defaultedProperties.join(', ') + ']';
+                    lines.push(line);
+                    writeDeps(p.dependencies, '');
+                });
+            } else {
+                // No plan check — log result items only
+                (savedResultData.items || []).forEach(function(r) {
+                    var status = r.success ? 'OK' : 'FAIL';
+                    var line = col(status, 8) + '  ' + col('Page', 14) + '  ' + (r.contentName || r.contentId);
+                    if (r.errorMessage) line += '  [' + r.errorMessage + ']';
+                    if (r.defaultedProperties && r.defaultedProperties.length)
+                        line += '  [defaults: ' + r.defaultedProperties.join(', ') + ']';
+                    lines.push(line);
+                });
+            }
+        }
+
+        var blob = new Blob([lines.join('\r\n')], { type: 'text/plain' });
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement('a');
+        a.href = url;
+        a.download = 'dxp-transfer-' + new Date().toISOString().slice(0, 19).replace(/:/g, '-') + '.txt';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
     }
 
     function resetResult() {
@@ -469,7 +767,7 @@ var dxpTransfer = (function () {
         return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
     }
 
-    return { check: check, confirm: confirm, cancel: cancel };
+    return { check: check, confirm: confirm, cancel: cancel, downloadLog: downloadLog };
 })();
 </script>
 </body>
