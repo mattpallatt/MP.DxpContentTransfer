@@ -172,14 +172,22 @@ If the transferred page's parent does not exist on the target, the gadget walks 
 
 ## Logging
 
-The gadget logs at `DEBUG` level under the logger name `DxpContentTransfer.Services.ContentTransferService`.
+The gadget logs at `DEBUG` level under the `DxpContentTransfer.Services` namespace:
 
-To enable API call logging (full request/response bodies for every Content Management API call), add the following to `appsettings.json`:
+| Logger | What it logs |
+|---|---|
+| `DxpContentTransfer.Services.CmaClient` | Every CMA/CDV request and response (method, URL, body) |
+| `DxpContentTransfer.Services.ContentTransferService` | Transfer decisions, dependency resolution, deferred patches, placeholders |
+| `DxpContentTransfer.Services.EnvironmentTokenService` | Token acquisition (the client secret is redacted) |
+
+Full request/response bodies are emitted whenever `DEBUG` is enabled for these loggers — there is no separate toggle. Enable it via your logging configuration, e.g. in `appsettings.json`:
 
 ```json
 {
-  "DxpContentTransfer": {
-    "LogApiCalls": true
+  "Logging": {
+    "LogLevel": {
+      "DxpContentTransfer.Services": "Debug"
+    }
   }
 }
 ```
