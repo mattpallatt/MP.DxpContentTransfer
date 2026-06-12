@@ -1,3 +1,4 @@
+using System.Net;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
@@ -9,7 +10,6 @@ using EPiServer.Core;
 using EPiServer.SpecializedProperties;
 using EPiServer.Web;
 using EPiServer.Web.Routing;
-using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 
 namespace DxpContentTransfer.Services;
@@ -18,28 +18,29 @@ public class ContentTransferService : IContentTransferService
 {
     private readonly IDxpSettingsService _settingsService;
     private readonly IEnvironmentTokenService _tokenService;
-    private readonly IHttpClientFactory _httpClientFactory;
+    private readonly CmaClient _cma;
     private readonly IContentLoader _contentLoader;
     private readonly IUrlResolver _urlResolver;
     private readonly ILogger<ContentTransferService> _logger;
-    private readonly bool _logApiCalls;
+
+    // A single CMA PUT can require several retries as we strip unknown/required properties one at
+    // a time off the body; this bounds that loop so a persistent server error can't spin forever.
+    private const int MaxWriteAttempts = 25;
 
     public ContentTransferService(
         IDxpSettingsService settingsService,
         IEnvironmentTokenService tokenService,
-        IHttpClientFactory httpClientFactory,
+        CmaClient cma,
         IContentLoader contentLoader,
         IUrlResolver urlResolver,
-        ILogger<ContentTransferService> logger,
-        IConfiguration configuration)
+        ILogger<ContentTransferService> logger)
     {
         _settingsService = settingsService;
         _tokenService = tokenService;
-        _httpClientFactory = httpClientFactory;
+        _cma = cma;
         _contentLoader = contentLoader;
         _urlResolver = urlResolver;
         _logger = logger;
-        _logApiCalls = configuration.GetValue<bool>("DxpContentTransfer:LogApiCalls");
     }
 
     // ── Pre-check ─────────────────────────────────────────────────────────────
@@ -74,7 +75,7 @@ public class ContentTransferService : IContentTransferService
             {
                 IContent content = null;
                 try { if (!ContentReference.IsNullOrEmpty(itemRef)) content = _contentLoader.Get<IContent>(itemRef, LanguageSelector.AutoDetect(true)); }
-                catch { }
+                catch (Exception ex) { _logger.LogDebug("Pre-check: could not load content {Ref}: {Error}", itemRef, ex.Message); }
 
                 Guid? directParentSourceGuid = null;
                 string directParentName = null;
@@ -86,7 +87,7 @@ public class ContentTransferService : IContentTransferService
                         directParentSourceGuid = parent.ContentGuid;
                         directParentName = parent.Name;
                     }
-                    catch { }
+                    catch (Exception ex) { _logger.LogDebug("Pre-check: could not load parent of {Ref}: {Error}", itemRef, ex.Message); }
                 }
 
                 var ancestorsWithUrls = new List<(IContent ancestor, string url)>();
@@ -365,15 +366,13 @@ public class ContentTransferService : IContentTransferService
             (parentGuid, parentPath) = await ResolveTargetParentAsync(ancestorsWithUrls, target, targetToken);
         }
 
-        var usedRootFallback = false;
+        var isRootFallback = false;
         if (!parentGuid.HasValue)
         {
             parentGuid = siteRootGuid;
             parentPath = siteRootPath;
-            usedRootFallback = true;
+            isRootFallback = true;
         }
-
-        var isRootFallback = usedRootFallback;
 
         if (existsOnTarget)
         {
@@ -414,20 +413,10 @@ public class ContentTransferService : IContentTransferService
 
     private async Task<bool> ExistsOnTargetAsync(Guid guid, DxpEnvironmentConfig target, string targetToken)
     {
-        var client = _httpClientFactory.CreateClient();
-        var url = $"{target.BaseUrl.TrimEnd('/')}/api/episerver/v3.0/contentmanagement/{guid}";
-        LogRequest("GET (exists check)", url, targetToken);
-        var request = new HttpRequestMessage(HttpMethod.Get, url);
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", targetToken);
-        var response = await client.SendAsync(request);
-        var body = await response.Content.ReadAsStringAsync();
-        LogResponse("GET (exists check)", url, (int)response.StatusCode, body);
-
+        var r = await _cma.GetManagementAsync(target.BaseUrl, targetToken, guid, "exists check");
         // 401/403 means the content EXISTS but our identity can't read it — treat as present
-        if (response.StatusCode is System.Net.HttpStatusCode.Unauthorized or System.Net.HttpStatusCode.Forbidden)
-            return true;
-
-        return response.StatusCode == System.Net.HttpStatusCode.OK;
+        if (r.Status is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden) return true;
+        return r.Status == HttpStatusCode.OK;
     }
 
     private async Task<(Guid? guid, string path)> ResolveTargetParentAsync(
@@ -481,33 +470,46 @@ public class ContentTransferService : IContentTransferService
         return chain; // nearest ancestor first
     }
 
-    private async Task<Guid?> FindByUrlOnTargetAsync(string relativeUrl, DxpEnvironmentConfig target, string targetToken)
+    // Looks up a content item GUID by its relative URL via the CDV endpoint. Source and target
+    // lookups are identical apart from which environment they hit, so they share this one body.
+    private async Task<Guid?> FindByUrlAsync(string baseUrl, string token, string relativeUrl, string purpose)
     {
-        var client = _httpClientFactory.CreateClient();
-        var apiUrl = $"{target.BaseUrl.TrimEnd('/')}/api/episerver/v3.0/content/?contentURL={Uri.EscapeDataString(relativeUrl)}";
-        LogRequest("GET (URL lookup on target)", apiUrl, targetToken);
-        var request = new HttpRequestMessage(HttpMethod.Get, apiUrl);
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", targetToken);
-        request.Headers.Add("Accept", "application/json");
-        var response = await client.SendAsync(request);
-        var json = await response.Content.ReadAsStringAsync();
-        LogResponse("GET (URL lookup on target)", apiUrl, (int)response.StatusCode, json);
-        if (!response.IsSuccessStatusCode) return null;
-        using var doc = JsonDocument.Parse(json);
-        var root = doc.RootElement;
+        var r = await _cma.GetByUrlAsync(baseUrl, token, relativeUrl, purpose);
+        // A not-found here is normal control flow (e.g. probing whether a folder exists), so this
+        // stays at Debug rather than Warning to avoid log noise.
+        if (!r.IsSuccess)
+        {
+            _logger.LogDebug("URL lookup returned {Status} for {Url}", (int)r.Status, relativeUrl);
+            return null;
+        }
+        return ExtractGuidFromContentResponse(r.Body, relativeUrl);
+    }
 
-        // Response may be a single object or an array
-        var element = root.ValueKind == JsonValueKind.Array
-            ? (root.GetArrayLength() > 0 ? root[0] : (JsonElement?)null)
-            : root;
+    private Task<Guid?> FindByUrlOnTargetAsync(string relativeUrl, DxpEnvironmentConfig target, string targetToken) =>
+        FindByUrlAsync(target.BaseUrl, targetToken, relativeUrl, "URL lookup on target");
 
-        if (element is null) return null;
-
-        if (element.Value.TryGetProperty("contentLink", out var cl) &&
-            cl.TryGetProperty("guidValue", out var guidProp) &&
-            Guid.TryParse(guidProp.GetString(), out var guid))
-            return guid;
-
+    // Extracts contentLink.guidValue from a CDV content response that may be a single object or
+    // an array (the by-URL endpoint returns an array when multiple matches exist).
+    private Guid? ExtractGuidFromContentResponse(string json, string relativeUrl)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
+            var element = root.ValueKind == JsonValueKind.Array
+                ? (root.GetArrayLength() > 0 ? root[0] : (JsonElement?)null)
+                : root;
+            if (element is null) return null;
+            if (element.Value.TryGetProperty("contentLink", out var cl) &&
+                cl.TryGetProperty("guidValue", out var guidProp) &&
+                Guid.TryParse(guidProp.GetString(), out var guid))
+                return guid;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug("Could not parse content response for {Url}: {Error}", relativeUrl, ex.Message);
+        }
+        _logger.LogDebug("URL lookup response had no guidValue for {Url}", relativeUrl);
         return null;
     }
 
@@ -542,20 +544,16 @@ public class ContentTransferService : IContentTransferService
             {
                 IContent content = null;
                 try { content = _contentLoader.Get<IContent>(itemRef, LanguageSelector.AutoDetect(true)); }
-                catch { }
+                catch (Exception ex) { _logger.LogDebug("Transfer: could not load content {Ref}: {Error}", itemRef, ex.Message); }
 
                 string contentName = null;
                 Guid sourceGuid = Guid.Empty;
-                int? sortIndex = null;
                 var ancestorsWithUrls = new List<(IContent ancestor, string url)>();
 
                 if (content != null)
                 {
                     contentName = content.Name;
                     sourceGuid = content.ContentGuid;
-
-                    var psiVal = content.Property["PageSortIndex"]?.Value;
-                    if (psiVal != null) try { sortIndex = Convert.ToInt32(psiVal); } catch { }
 
                     foreach (var a in BuildAncestorChain(content.ParentLink))
                     {
@@ -566,9 +564,9 @@ public class ContentTransferService : IContentTransferService
                     }
                 }
 
-                return (itemRef, content, contentName, sourceGuid, sortIndex, ancestorsWithUrls);
+                return (itemRef, content, contentName, sourceGuid, ancestorsWithUrls);
             })
-            .ToList(); // sortIndex is int? — null means "could not read", 0 is a valid explicit value
+            .ToList();
 
         // All IContentLoader work done — now safe to await.
         string targetToken;
@@ -591,7 +589,7 @@ public class ContentTransferService : IContentTransferService
             planLookup.TryGetValue(ctx.itemRef.ToString(), out var planItem);
             var itemResult = await TransferSingleItemAsync(
                 ctx.itemRef, ctx.content, ctx.contentName, ctx.sourceGuid,
-                ctx.sortIndex, ctx.ancestorsWithUrls,
+                ctx.ancestorsWithUrls,
                 source.BaseUrl, sourceToken, target, targetToken,
                 planItem, transferStatus, onItemComplete, deferredPatches);
             result.Items.Add(itemResult);
@@ -710,7 +708,6 @@ public class ContentTransferService : IContentTransferService
         IContent content,
         string contentName,
         Guid sourceGuid,
-        int? sortIndex,
         List<(IContent ancestor, string url)> ancestorsWithUrls,
         string sourceBaseUrl,
         string sourceToken,
@@ -721,7 +718,7 @@ public class ContentTransferService : IContentTransferService
         Action onItemComplete = null,
         List<(Guid guid, string property, string json)> deferredPatches = null)
     {
-        // content, contentName, sourceGuid, sortIndex, ancestorsWithUrls are all pre-loaded by caller.
+        // content, contentName, sourceGuid, ancestorsWithUrls are all pre-loaded by caller.
         if (content == null)
             return new TransferItemResult { ContentId = contentRef.ToString(), Success = false, ErrorMessage = "Could not load content." };
 
@@ -763,7 +760,7 @@ public class ContentTransferService : IContentTransferService
                 sourceGuid, sourceJson, sourceBaseUrl, sourceToken,
                 target, targetToken, targetGuid, targetParentGuid,
                 (transferStatus == "CheckedOut") ? "CheckedOut" : "Published",
-                visited, onItemComplete, sortIndex, deferredPatches, failedDependencyGuids);
+                visited, onItemComplete, deferredPatches, failedDependencyGuids);
 
             return new TransferItemResult
             {
@@ -805,7 +802,6 @@ public class ContentTransferService : IContentTransferService
         string effectiveStatus,
         HashSet<Guid> visited,
         Action onItemComplete,
-        int? sortIndex = null,
         List<(Guid guid, string property, string json)> deferredPatches = null,
         List<string> failedDependencyGuids = null)
     {
@@ -915,7 +911,7 @@ public class ContentTransferService : IContentTransferService
                     refGuid, refJson, sourceBaseUrl, sourceToken,
                     target, targetToken,
                     refGuid, blockParentGuid,
-                    effectiveStatus, visited, onItemComplete, sortIndex: null, deferredPatches, failedDependencyGuids);
+                    effectiveStatus, visited, onItemComplete, deferredPatches, failedDependencyGuids);
             }
             catch (Exception ex)
             {
@@ -1115,38 +1111,12 @@ public class ContentTransferService : IContentTransferService
         return ordered;
     }
 
-    private void LogRequest(string description, string url, string token, string requestBody = null)
-    {
-        var method = description.Split(' ')[0]; // e.g. "GET" or "PUT"
-        var sb = new System.Text.StringBuilder();
-        sb.AppendLine($">>> {method} {url}");
-        sb.AppendLine($"    Purpose: {description}");
-        if (!string.IsNullOrEmpty(requestBody))
-        {
-            sb.AppendLine("    Content-Type: application/json");
-            sb.AppendLine(requestBody);
-        }
-        _logger.LogDebug("{HttpRequest}", sb.ToString().TrimEnd());
-    }
-
-    private void LogResponse(string description, string url, int statusCode, string responseBody)
-    {
-        _logger.LogDebug("<<< {Status} {Description} {Url}\n{ResponseBody}", statusCode, description, url, responseBody);
-    }
-
     private async Task<string> ReadFromSourceAsync(Guid guid, string sourceBaseUrl, string sourceToken)
     {
-        var client = _httpClientFactory.CreateClient();
-        var url = $"{sourceBaseUrl.TrimEnd('/')}/api/episerver/v3.0/contentmanagement/{guid}";
-        LogRequest("GET", url, sourceToken);
-        var request = new HttpRequestMessage(HttpMethod.Get, url);
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", sourceToken);
-        var response = await client.SendAsync(request);
-        var body = await response.Content.ReadAsStringAsync();
-        LogResponse("GET", url, (int)response.StatusCode, body);
-        if (!response.IsSuccessStatusCode)
-            throw new HttpRequestException($"HTTP {(int)response.StatusCode}: {body}");
-        return body;
+        var r = await _cma.GetManagementAsync(sourceBaseUrl, sourceToken, guid, "read source");
+        if (!r.IsSuccess)
+            throw new HttpRequestException($"HTTP {(int)r.Status}: {r.Body}");
+        return r.Body;
     }
 
     private static readonly string[] ReadOnlyProperties =
@@ -1173,43 +1143,78 @@ public class ContentTransferService : IContentTransferService
 
     private static readonly string[] ContentRefEnvFields = ["id", "workId", "url", "providerName", "expanded"];
 
-    private static void StripContentReferenceIds(JsonNode node)
+    // ── Generic JSON tree visitors ────────────────────────────────────────────
+    // One small set of walkers replaces the half-dozen near-identical hand-rolled
+    // "if object recurse / if array recurse" methods that used to be copy-pasted here.
+
+    // Invokes onObject for every JsonObject in a mutable tree (depth-first, parent first).
+    private static void WalkJsonObjects(JsonNode node, Action<JsonObject> onObject)
     {
         if (node is JsonObject obj)
         {
-            if (obj.ContainsKey("guidValue"))
-            {
-                // Keep only guidValue. id/workId are environment-specific integers;
-                // url/providerName/expanded are source-server values that confuse the target.
-                foreach (var field in ContentRefEnvFields)
-                    obj.Remove(field);
-            }
+            onObject(obj);
             foreach (var child in obj.Select(kvp => kvp.Value).ToList())
-                if (child != null) StripContentReferenceIds(child);
+                if (child != null) WalkJsonObjects(child, onObject);
         }
         else if (node is JsonArray arr)
         {
             foreach (var item in arr)
-                if (item != null) StripContentReferenceIds(item);
+                if (item != null) WalkJsonObjects(item, onObject);
         }
     }
 
-    // Strips properties of type PropertyBlob — server-managed blobs (thumbnail, etc.)
-    // that are auto-generated on upload and cannot be written via the API.
-    private static string StripBlobProperties(string json)
+    // Invokes onObject for every object-kind element in a read-only tree (depth-first, parent first).
+    private static void WalkJsonElements(JsonElement element, Action<JsonElement> onObject)
     {
-        var node = JsonNode.Parse(json)?.AsObject();
-        if (node == null) return json;
-        var toRemove = node
-            .Where(kvp =>
-                kvp.Value is JsonObject obj &&
-                obj["propertyDataType"]?.GetValue<string>() == "PropertyBlob")
-            .Select(kvp => kvp.Key)
-            .ToList();
-        foreach (var key in toRemove)
-            node.Remove(key);
-        return node.ToJsonString();
+        if (element.ValueKind == JsonValueKind.Object)
+        {
+            onObject(element);
+            foreach (var prop in element.EnumerateObject())
+                WalkJsonElements(prop.Value, onObject);
+        }
+        else if (element.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var item in element.EnumerateArray())
+                WalkJsonElements(item, onObject);
+        }
     }
+
+    // Applies transform to every string value in the tree, whether held as an object
+    // property or an array element.
+    private static void MutateJsonStrings(JsonNode node, Func<string, string> transform)
+    {
+        if (node is JsonObject obj)
+        {
+            foreach (var key in obj.Select(kvp => kvp.Key).ToList())
+            {
+                var child = obj[key];
+                if (child is JsonValue val && val.TryGetValue(out string str))
+                    obj[key] = transform(str);
+                else if (child != null)
+                    MutateJsonStrings(child, transform);
+            }
+        }
+        else if (node is JsonArray arr)
+        {
+            for (int i = 0; i < arr.Count; i++)
+            {
+                if (arr[i] is JsonValue val && val.TryGetValue(out string str))
+                    arr[i] = transform(str);
+                else if (arr[i] != null)
+                    MutateJsonStrings(arr[i], transform);
+            }
+        }
+    }
+
+    private static void StripContentReferenceIds(JsonNode node) =>
+        WalkJsonObjects(node, obj =>
+        {
+            // For content-reference objects keep only guidValue. id/workId are environment-specific
+            // integers; url/providerName/expanded are source-server values that confuse the target.
+            if (obj.ContainsKey("guidValue"))
+                foreach (var field in ContentRefEnvFields)
+                    obj.Remove(field);
+        });
 
     private static string InjectStatus(string json, string status)
     {
@@ -1217,22 +1222,6 @@ public class ContentTransferService : IContentTransferService
         if (node == null) return json;
         node["status"] = status;
         return node.ToJsonString();
-    }
-
-    // Injects a pre-extracted sort index into the PUT body.
-    // Sort index is read synchronously from IContentLoader before any awaits in the caller.
-    private static string InjectSortIndex(string json, int? sortIndex)
-    {
-        if (!sortIndex.HasValue) return json;
-        try
-        {
-            var node = JsonNode.Parse(json)?.AsObject();
-            if (node == null) return json;
-            node["sortIndex"] = sortIndex.Value;
-            return node.ToJsonString();
-        }
-        catch { }
-        return json;
     }
 
     private static string InjectParentLink(string json, Guid parentGuid)
@@ -1254,45 +1243,32 @@ public class ContentTransferService : IContentTransferService
         return node.ToJsonString();
     }
 
-    private static void InjectContentIds(JsonNode node, Dictionary<Guid, int?> targetIdMap)
-    {
-        if (node is JsonObject obj)
+    private static void InjectContentIds(JsonNode node, Dictionary<Guid, int?> targetIdMap) =>
+        WalkJsonObjects(node, obj =>
         {
-            if (obj["guidValue"] is JsonValue guidVal)
+            if (obj["guidValue"] is not JsonValue guidVal) return;
+            try
             {
-                try
+                if (Guid.TryParse(guidVal.GetValue<string>(), out var guid) &&
+                    targetIdMap.TryGetValue(guid, out var targetId) &&
+                    targetId.HasValue)
                 {
-                    if (Guid.TryParse(guidVal.GetValue<string>(), out var guid) &&
-                        targetIdMap.TryGetValue(guid, out var targetId) &&
-                        targetId.HasValue)
-                    {
-                        obj["id"] = targetId.Value;
-                        obj["workId"] = 0;
-                    }
+                    obj["id"] = targetId.Value;
+                    obj["workId"] = 0;
                 }
-                catch { }
             }
-            foreach (var child in obj.Select(kvp => kvp.Value).ToList())
-                if (child != null) InjectContentIds(child, targetIdMap);
-        }
-        else if (node is JsonArray arr)
-        {
-            foreach (var item in arr)
-                if (item != null) InjectContentIds(item, targetIdMap);
-        }
-    }
+            catch { }
+        });
 
     private async Task<int?> GetTargetContentIdAsync(Guid guid, DxpEnvironmentConfig target, string targetToken)
     {
-        var client = _httpClientFactory.CreateClient();
-        var url = $"{target.BaseUrl.TrimEnd('/')}/api/episerver/v3.0/contentmanagement/{guid}";
-        LogRequest("GET (get target ID)", url, targetToken);
-        var request = new HttpRequestMessage(HttpMethod.Get, url);
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", targetToken);
-        var response = await client.SendAsync(request);
-        var body = await response.Content.ReadAsStringAsync();
-        LogResponse("GET (get target ID)", url, (int)response.StatusCode, body);
-        if (!response.IsSuccessStatusCode) return null;
+        var r = await _cma.GetManagementAsync(target.BaseUrl, targetToken, guid, "get target ID");
+        return r.IsSuccess ? ExtractContentLinkId(r.Body) : null;
+    }
+
+    // Extracts contentLink.id (the environment-specific integer id) from a CMA response body.
+    private static int? ExtractContentLinkId(string body)
+    {
         try
         {
             using var doc = JsonDocument.Parse(body);
@@ -1318,49 +1294,17 @@ public class ContentTransferService : IContentTransferService
         return null;
     }
 
-    // Fetches the content URL from the target environment after an asset has been written.
-    // Used when the PUT response doesn't include a url field (so xhtmlUrlMap can still be populated).
-    private async Task<string> GetTargetContentUrlAsync(Guid guid, DxpEnvironmentConfig target, string targetToken)
-    {
-        var client = _httpClientFactory.CreateClient();
-        var url = $"{target.BaseUrl.TrimEnd('/')}/api/episerver/v3.0/contentmanagement/{guid}";
-        LogRequest("GET (fetch target URL after upload)", url, targetToken);
-        var request = new HttpRequestMessage(HttpMethod.Get, url);
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", targetToken);
-        var response = await client.SendAsync(request);
-        var body = await response.Content.ReadAsStringAsync();
-        LogResponse("GET (fetch target URL after upload)", url, (int)response.StatusCode, body);
-        if (!response.IsSuccessStatusCode) return null;
-        try
-        {
-            using var doc = JsonDocument.Parse(body);
-            if (doc.RootElement.TryGetProperty("url", out var urlProp) &&
-                urlProp.ValueKind == JsonValueKind.String)
-            {
-                var fullUrl = urlProp.GetString() ?? "";
-                if (Uri.TryCreate(fullUrl, UriKind.Absolute, out var uri))
-                    return uri.PathAndQuery;
-                if (fullUrl.StartsWith('/')) return fullUrl;
-            }
-        }
-        catch { }
-        return null;
-    }
-
     // Uses the Content Delivery API (not CMA) to resolve a canonical relative URL for content on the target.
     // CMA GET returns "url": null for contentassets images; CDV returns the real path via contentLink.url.
     private async Task<string> GetTargetContentUrlViaCdvAsync(Guid guid, DxpEnvironmentConfig target, string targetToken)
     {
-        var client = _httpClientFactory.CreateClient();
-        var apiUrl = $"{target.BaseUrl.TrimEnd('/')}/api/episerver/v3.0/content/{guid}";
-        var request = new HttpRequestMessage(HttpMethod.Get, apiUrl);
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", targetToken);
-        request.Headers.Add("Accept", "application/json");
-        LogRequest("GET (CDV — resolve target asset URL)", apiUrl, targetToken);
-        var response = await client.SendAsync(request);
-        var body = await response.Content.ReadAsStringAsync();
-        LogResponse("GET (CDV — resolve target asset URL)", apiUrl, (int)response.StatusCode, body);
-        if (!response.IsSuccessStatusCode) return null;
+        var r = await _cma.GetDeliveryAsync(target.BaseUrl, targetToken, guid, "CDV resolve target asset URL");
+        return r.IsSuccess ? ExtractContentLinkUrlPath(r.Body) : null;
+    }
+
+    // Extracts contentLink.url from a CDV response and returns its absolute path component.
+    private static string ExtractContentLinkUrlPath(string body)
+    {
         try
         {
             using var doc = JsonDocument.Parse(body);
@@ -1374,41 +1318,6 @@ public class ContentTransferService : IContentTransferService
             }
         }
         catch { }
-        return null;
-    }
-
-    // Resolves the correct parent folder GUID on the TARGET for a globalassets image.
-    // Reads parentLink.url from the source image JSON, extracts the relative path, looks it up
-    // on the target, and creates any missing intermediate folders if needed.
-    private async Task<Guid?> ResolveGlobalAssetFolderOnTargetAsync(
-        string imgJson,
-        DxpEnvironmentConfig target, string targetToken,
-        string sourceBaseUrl, string sourceToken)
-    {
-        try
-        {
-            string parentUrl;
-            using (var doc = JsonDocument.Parse(imgJson))
-            {
-                var root = doc.RootElement;
-                if (!root.TryGetProperty("parentLink", out var pl) || pl.ValueKind != JsonValueKind.Object) return null;
-                if (!pl.TryGetProperty("url", out var urlProp) || urlProp.ValueKind != JsonValueKind.String) return null;
-                parentUrl = urlProp.GetString();
-            }
-            if (string.IsNullOrEmpty(parentUrl)) return null;
-
-            var relPath = Uri.TryCreate(parentUrl, UriKind.Absolute, out var uri) ? uri.AbsolutePath : parentUrl;
-            if (!relPath.EndsWith('/')) relPath += '/';
-            if (!relPath.StartsWith("/globalassets/", StringComparison.OrdinalIgnoreCase)) return null;
-
-            // Try direct lookup first; if not found, create the full folder path
-            return await FindByUrlOnTargetAsync(relPath, target, targetToken)
-                ?? await EnsureGlobalAssetFolderPathAsync(relPath, sourceBaseUrl, sourceToken, target, targetToken);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning("ResolveGlobalAssetFolderOnTargetAsync failed: {Error}", ex.Message);
-        }
         return null;
     }
 
@@ -1496,61 +1405,14 @@ public class ContentTransferService : IContentTransferService
     // e.g. for an EPiServer internal image URL the CDV returns "/globalassets/events/image.jpg".
     private async Task<string> GetSourceContentUrlAsync(Guid guid, string sourceBaseUrl, string sourceToken)
     {
-        try
-        {
-            var client = _httpClientFactory.CreateClient();
-            var apiUrl = $"{sourceBaseUrl.TrimEnd('/')}/api/episerver/v3.0/content/{guid}";
-            var request = new HttpRequestMessage(HttpMethod.Get, apiUrl);
-            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", sourceToken);
-            request.Headers.Add("Accept", "application/json");
-            var response = await client.SendAsync(request);
-            if (!response.IsSuccessStatusCode) return null;
-            var json = await response.Content.ReadAsStringAsync();
-            using var doc = JsonDocument.Parse(json);
-            if (doc.RootElement.TryGetProperty("contentLink", out var cl) &&
-                cl.TryGetProperty("url", out var urlProp) &&
-                urlProp.ValueKind == JsonValueKind.String)
-            {
-                var fullUrl = urlProp.GetString();
-                if (string.IsNullOrEmpty(fullUrl)) return null;
-                return Uri.TryCreate(fullUrl, UriKind.Absolute, out var uri) ? uri.AbsolutePath : fullUrl;
-            }
-        }
-        catch { /* best-effort */ }
-        return null;
+        var r = await _cma.GetDeliveryAsync(sourceBaseUrl, sourceToken, guid, "CDV resolve source content URL");
+        return r.IsSuccess ? ExtractContentLinkUrlPath(r.Body) : null;
     }
 
     // Looks up a content item GUID on the SOURCE environment by its relative URL.
     // Used for /globalassets/ paths where the GUID cannot be extracted directly.
-    private async Task<Guid?> FindByUrlOnSourceAsync(string relativeUrl, string sourceBaseUrl, string sourceToken)
-    {
-        var client = _httpClientFactory.CreateClient();
-        var apiUrl = $"{sourceBaseUrl.TrimEnd('/')}/api/episerver/v3.0/content/?contentURL={Uri.EscapeDataString(relativeUrl)}";
-        LogRequest("GET (URL lookup on source)", apiUrl, sourceToken);
-        var request = new HttpRequestMessage(HttpMethod.Get, apiUrl);
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", sourceToken);
-        request.Headers.Add("Accept", "application/json");
-        var response = await client.SendAsync(request);
-        var json = await response.Content.ReadAsStringAsync();
-        LogResponse("GET (URL lookup on source)", apiUrl, (int)response.StatusCode, json);
-        if (!response.IsSuccessStatusCode)
-        {
-            _logger.LogWarning("XHTML URL lookup returned {Status} for {Url}", (int)response.StatusCode, relativeUrl);
-            return null;
-        }
-        using var doc = JsonDocument.Parse(json);
-        var root = doc.RootElement;
-        var element = root.ValueKind == JsonValueKind.Array
-            ? (root.GetArrayLength() > 0 ? root[0] : (JsonElement?)null)
-            : root;
-        if (element is null) return null;
-        if (element.Value.TryGetProperty("contentLink", out var cl) &&
-            cl.TryGetProperty("guidValue", out var gp) &&
-            Guid.TryParse(gp.GetString(), out var guid))
-            return guid;
-        _logger.LogWarning("XHTML URL lookup response had no guidValue for {Url}", relativeUrl);
-        return null;
-    }
+    private Task<Guid?> FindByUrlOnSourceAsync(string relativeUrl, string sourceBaseUrl, string sourceToken) =>
+        FindByUrlAsync(sourceBaseUrl, sourceToken, relativeUrl, "URL lookup on source");
 
     // Extracts all image src attribute values from PropertyXhtmlString fields in a JSON document.
     private static List<string> ExtractXhtmlImageUrls(string json)
@@ -1565,28 +1427,19 @@ public class ContentTransferService : IContentTransferService
         return urls;
     }
 
-    private static void CollectXhtmlUrls(JsonElement element, List<string> urls)
-    {
-        if (element.ValueKind == JsonValueKind.Object)
+    private static void CollectXhtmlUrls(JsonElement element, List<string> urls) =>
+        WalkJsonElements(element, obj =>
         {
-            if (element.TryGetProperty("propertyDataType", out var pdt) &&
+            if (obj.TryGetProperty("propertyDataType", out var pdt) &&
                 pdt.GetString() == "PropertyXhtmlString" &&
-                element.TryGetProperty("value", out var val) &&
+                obj.TryGetProperty("value", out var val) &&
                 val.ValueKind == JsonValueKind.String)
             {
                 var html = val.GetString() ?? "";
                 foreach (Match m in Regex.Matches(html, @"src=""([^""]+)"""))
                     urls.Add(m.Groups[1].Value);
             }
-            foreach (var prop in element.EnumerateObject())
-                CollectXhtmlUrls(prop.Value, urls);
-        }
-        else if (element.ValueKind == JsonValueKind.Array)
-        {
-            foreach (var item in element.EnumerateArray())
-                CollectXhtmlUrls(item, urls);
-        }
-    }
+        });
 
     // Replaces the source environment origin (scheme+host) with the target origin in every
     // string value throughout the JSON document. Handles plain URL properties (PropertyUrl,
@@ -1609,43 +1462,11 @@ public class ContentTransferService : IContentTransferService
         catch { return json; }
     }
 
-    private static void ReplaceOriginInNodes(JsonNode node, string sourceOrigin, string targetOrigin)
-    {
-        if (node is JsonObject obj)
-        {
-            foreach (var key in obj.Select(kvp => kvp.Key).ToList())
-            {
-                var child = obj[key];
-                if (child is JsonValue val && val.TryGetValue(out string str) &&
-                    !string.IsNullOrEmpty(str) &&
-                    str.Contains(sourceOrigin, StringComparison.OrdinalIgnoreCase))
-                {
-                    obj[key] = str.Replace(sourceOrigin, targetOrigin, StringComparison.OrdinalIgnoreCase);
-                }
-                else if (child is JsonObject || child is JsonArray)
-                {
-                    ReplaceOriginInNodes(child, sourceOrigin, targetOrigin);
-                }
-            }
-        }
-        else if (node is JsonArray arr)
-        {
-            for (int i = 0; i < arr.Count; i++)
-            {
-                var item = arr[i];
-                if (item is JsonValue val && val.TryGetValue(out string str) &&
-                    !string.IsNullOrEmpty(str) &&
-                    str.Contains(sourceOrigin, StringComparison.OrdinalIgnoreCase))
-                {
-                    arr[i] = str.Replace(sourceOrigin, targetOrigin, StringComparison.OrdinalIgnoreCase);
-                }
-                else if (item is JsonObject || item is JsonArray)
-                {
-                    ReplaceOriginInNodes(item, sourceOrigin, targetOrigin);
-                }
-            }
-        }
-    }
+    private static void ReplaceOriginInNodes(JsonNode node, string sourceOrigin, string targetOrigin) =>
+        MutateJsonStrings(node, str =>
+            !string.IsNullOrEmpty(str) && str.Contains(sourceOrigin, StringComparison.OrdinalIgnoreCase)
+                ? str.Replace(sourceOrigin, targetOrigin, StringComparison.OrdinalIgnoreCase)
+                : str);
 
     // Resolves internal link URLs in PropertyLinkCollection items and PropertyUrl properties
     // to their correct target-environment URLs. Simple domain replacement is not sufficient
@@ -1778,35 +1599,25 @@ public class ContentTransferService : IContentTransferService
         return node.ToJsonString();
     }
 
-    private static void RewriteXhtmlNodes(JsonNode node, string origin, Dictionary<string, string> xhtmlUrlMap = null)
-    {
-        if (node is JsonObject obj)
+    private static void RewriteXhtmlNodes(JsonNode node, string origin, Dictionary<string, string> xhtmlUrlMap = null) =>
+        WalkJsonObjects(node, obj =>
         {
-            if (obj["propertyDataType"]?.GetValue<string>() == "PropertyXhtmlString" &&
-                obj["value"] is JsonValue val)
+            if (obj["propertyDataType"]?.GetValue<string>() != "PropertyXhtmlString" ||
+                obj["value"] is not JsonValue val)
+                return;
+            try
             {
-                try
-                {
-                    var html = val.GetValue<string>() ?? "";
-                    if (html.Contains(origin, StringComparison.OrdinalIgnoreCase))
-                        html = html.Replace(origin, "", StringComparison.OrdinalIgnoreCase);
-                    if (xhtmlUrlMap != null)
-                        foreach (var (src, tgt) in xhtmlUrlMap)
-                            if (!string.IsNullOrEmpty(src) && !string.IsNullOrEmpty(tgt))
-                                html = html.Replace(src, tgt, StringComparison.OrdinalIgnoreCase);
-                    obj["value"] = html;
-                }
-                catch { }
+                var html = val.GetValue<string>() ?? "";
+                if (html.Contains(origin, StringComparison.OrdinalIgnoreCase))
+                    html = html.Replace(origin, "", StringComparison.OrdinalIgnoreCase);
+                if (xhtmlUrlMap != null)
+                    foreach (var (src, tgt) in xhtmlUrlMap)
+                        if (!string.IsNullOrEmpty(src) && !string.IsNullOrEmpty(tgt))
+                            html = html.Replace(src, tgt, StringComparison.OrdinalIgnoreCase);
+                obj["value"] = html;
             }
-            foreach (var child in obj.Select(kvp => kvp.Value).ToList())
-                if (child != null) RewriteXhtmlNodes(child, origin, xhtmlUrlMap);
-        }
-        else if (node is JsonArray arr)
-        {
-            foreach (var item in arr)
-                if (item != null) RewriteXhtmlNodes(item, origin, xhtmlUrlMap);
-        }
-    }
+            catch { }
+        });
 
     // Converts an absolute URL to its path component, or returns the input unchanged if
     // it is already relative.
@@ -1830,27 +1641,15 @@ public class ContentTransferService : IContentTransferService
         return guids;
     }
 
-    private static void CollectGuids(JsonElement element, List<Guid> guids, HashSet<Guid> seen)
-    {
-        if (element.ValueKind == JsonValueKind.Object)
+    private static void CollectGuids(JsonElement element, List<Guid> guids, HashSet<Guid> seen) =>
+        WalkJsonElements(element, obj =>
         {
-            foreach (var prop in element.EnumerateObject())
-            {
-                if (prop.Name == "guidValue" &&
-                    prop.Value.ValueKind == JsonValueKind.String &&
-                    Guid.TryParse(prop.Value.GetString(), out var guid) &&
-                    seen.Add(guid))
-                    guids.Add(guid);
-
-                CollectGuids(prop.Value, guids, seen);
-            }
-        }
-        else if (element.ValueKind == JsonValueKind.Array)
-        {
-            foreach (var item in element.EnumerateArray())
-                CollectGuids(item, guids, seen);
-        }
-    }
+            if (obj.TryGetProperty("guidValue", out var gv) &&
+                gv.ValueKind == JsonValueKind.String &&
+                Guid.TryParse(gv.GetString(), out var guid) &&
+                seen.Add(guid))
+                guids.Add(guid);
+        });
 
     private async Task<(int? id, string targetRelUrl)> WriteAssetToTargetAsync(
         Guid guid,
@@ -1865,8 +1664,8 @@ public class ContentTransferService : IContentTransferService
         if (binaryUrl == null)
             return (await WriteToTargetAsync(guid, cleanJson, target, targetToken), null);
 
-        var client = _httpClientFactory.CreateClient();
-        LogRequest("GET (binary download)", binaryUrl, sourceToken);
+        var client = _cma.CreateClient();
+        _logger.LogDebug(">>> GET (binary download) {Url}", binaryUrl);
         var dlRequest = new HttpRequestMessage(HttpMethod.Get, binaryUrl);
         dlRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", sourceToken);
         var dlResponse = await client.SendAsync(dlRequest, HttpCompletionOption.ResponseHeadersRead);
@@ -1874,8 +1673,6 @@ public class ContentTransferService : IContentTransferService
 
         if (!dlResponse.IsSuccessStatusCode)
         {
-            var dlBody = await dlResponse.Content.ReadAsStringAsync();
-            LogResponse("GET (binary download)", binaryUrl, (int)dlResponse.StatusCode, dlBody);
             _logger.LogWarning("Could not download binary for asset {Guid} from {Url} ({Status}) — transferring metadata only", guid, binaryUrl, (int)dlResponse.StatusCode);
             return (await WriteToTargetAsync(guid, cleanJson, target, targetToken), null);
         }
@@ -1890,9 +1687,9 @@ public class ContentTransferService : IContentTransferService
         var url = $"{target.BaseUrl.TrimEnd('/')}/api/episerver/v3.0/contentmanagement/{guid}";
         var activeJson = cleanJson;
 
-        for (var attempt = 0; attempt < 10; attempt++)
+        for (var attempt = 0; attempt < MaxWriteAttempts; attempt++)
         {
-            _logger.LogDebug(">>> PUT {Url}\n    Purpose: PUT (multipart) — uploading asset binary + metadata to target\n    Content-Type: multipart/form-data\n[content part]\n{Json}\n[file part] name={FileName} mimeType={Mime} size={Bytes}",
+            _logger.LogDebug(">>> PUT (multipart) {Url}\n    Content-Type: multipart/form-data\n[content part]\n{Json}\n[file part] name={FileName} mimeType={Mime} size={Bytes}",
                 url, activeJson, fileName, mimeType, binaryStream.Length);
             var putRequest = new HttpRequestMessage(HttpMethod.Put, url);
             putRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", targetToken);
@@ -1907,34 +1704,12 @@ public class ContentTransferService : IContentTransferService
 
             var response = await client.SendAsync(putRequest);
             var responseBody = await response.Content.ReadAsStringAsync();
-            LogResponse("PUT (multipart)", url, (int)response.StatusCode, responseBody);
+            _logger.LogDebug("<<< {Status} PUT (multipart) {Url}\n{Body}", (int)response.StatusCode, url, responseBody);
 
             if (response.IsSuccessStatusCode)
-            {
-                try
-                {
-                    using var doc = JsonDocument.Parse(responseBody);
-                    int? id = null;
-                    string targetRelUrl = null;
-                    if (doc.RootElement.TryGetProperty("contentLink", out var cl) &&
-                        cl.TryGetProperty("id", out var idProp) &&
-                        idProp.ValueKind == JsonValueKind.Number)
-                        id = idProp.GetInt32();
-                    if (doc.RootElement.TryGetProperty("url", out var urlProp) &&
-                        urlProp.ValueKind == JsonValueKind.String)
-                    {
-                        var fullUrl = urlProp.GetString() ?? "";
-                        targetRelUrl = Uri.TryCreate(fullUrl, UriKind.Absolute, out var uri)
-                            ? uri.PathAndQuery
-                            : (fullUrl.StartsWith('/') ? fullUrl : null);
-                    }
-                    return (id, targetRelUrl);
-                }
-                catch { }
-                return (null, null);
-            }
+                return (ExtractContentLinkId(responseBody), ExtractUrlPathAndQuery(responseBody));
 
-            if (response.StatusCode == System.Net.HttpStatusCode.BadRequest)
+            if (response.StatusCode == HttpStatusCode.BadRequest)
             {
                 var unknownProp = ExtractPropertyNotFoundName(responseBody);
                 if (unknownProp != null)
@@ -1945,36 +1720,38 @@ public class ContentTransferService : IContentTransferService
                 }
             }
 
-            if (response.StatusCode == System.Net.HttpStatusCode.Conflict)
+            if (response.StatusCode == HttpStatusCode.Conflict)
             {
                 // Asset already exists on target under a different parent — use the existing version.
                 _logger.LogDebug("Asset {Guid} already exists on target with a different parent (InvalidParent) — reusing existing", guid);
                 var existingId = await GetTargetContentIdAsync(guid, target, targetToken);
-                string existingUrl = null;
                 var existingJson = await ReadFromTargetAsync(guid, target, targetToken);
-                if (existingJson != null)
-                {
-                    try
-                    {
-                        using var doc = JsonDocument.Parse(existingJson);
-                        if (doc.RootElement.TryGetProperty("url", out var urlProp) &&
-                            urlProp.ValueKind == JsonValueKind.String)
-                        {
-                            var fullUrl = urlProp.GetString() ?? "";
-                            existingUrl = Uri.TryCreate(fullUrl, UriKind.Absolute, out var uri)
-                                ? uri.PathAndQuery
-                                : (fullUrl.StartsWith('/') ? fullUrl : null);
-                        }
-                    }
-                    catch { }
-                }
-                return (existingId, existingUrl);
+                return (existingId, existingJson != null ? ExtractUrlPathAndQuery(existingJson) : null);
             }
 
             throw new HttpRequestException($"HTTP {(int)response.StatusCode}: {responseBody}");
         }
 
-        throw new HttpRequestException("Asset write failed after stripping multiple unknown properties");
+        throw new HttpRequestException($"Asset write failed after {MaxWriteAttempts} attempts resolving property errors");
+    }
+
+    // Extracts the top-level CMA "url" field and returns its path + query component.
+    private static string ExtractUrlPathAndQuery(string body)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(body);
+            if (doc.RootElement.TryGetProperty("url", out var urlProp) &&
+                urlProp.ValueKind == JsonValueKind.String)
+            {
+                var fullUrl = urlProp.GetString() ?? "";
+                return Uri.TryCreate(fullUrl, UriKind.Absolute, out var uri)
+                    ? uri.PathAndQuery
+                    : (fullUrl.StartsWith('/') ? fullUrl : null);
+            }
+        }
+        catch { }
+        return null;
     }
 
     private static string GetAssetBinaryUrl(string json)
@@ -2256,13 +2033,8 @@ public class ContentTransferService : IContentTransferService
 
     private async Task<string> ReadFromTargetAsync(Guid guid, DxpEnvironmentConfig target, string targetToken)
     {
-        var client = _httpClientFactory.CreateClient();
-        var url = $"{target.BaseUrl.TrimEnd('/')}/api/episerver/v3.0/contentmanagement/{guid}";
-        var request = new HttpRequestMessage(HttpMethod.Get, url);
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", targetToken);
-        var response = await client.SendAsync(request);
-        if (!response.IsSuccessStatusCode) return null;
-        return await response.Content.ReadAsStringAsync();
+        var r = await _cma.GetManagementAsync(target.BaseUrl, targetToken, guid, "read target");
+        return r.IsSuccess ? r.Body : null;
     }
 
     private static string StripNamedProperty(string json, string propertyName)
@@ -2417,38 +2189,18 @@ public class ContentTransferService : IContentTransferService
         List<(Guid guid, string property, string json)> deferredPatches = null,
         string sourceBaseUrl = null, string sourceToken = null)
     {
-        var client = _httpClientFactory.CreateClient();
-        var url = $"{target.BaseUrl.TrimEnd('/')}/api/episerver/v3.0/contentmanagement/{guid}";
         var activeJson = contentJson;
         var strippedProps = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        for (var attempt = 0; attempt < 25; attempt++)
+        for (var attempt = 0; attempt < MaxWriteAttempts; attempt++)
         {
-            LogRequest("PUT", url, token, activeJson);
-            var request = new HttpRequestMessage(HttpMethod.Put, url)
-            {
-                Content = new StringContent(activeJson, Encoding.UTF8, "application/json")
-            };
-            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-            var response = await client.SendAsync(request);
-            var body = await response.Content.ReadAsStringAsync();
-            LogResponse("PUT", url, (int)response.StatusCode, body);
+            var response = await _cma.PutManagementAsync(target.BaseUrl, token, guid, activeJson, "write content");
+            var body = response.Body;
 
-            if (response.IsSuccessStatusCode)
-            {
-                try
-                {
-                    using var doc = JsonDocument.Parse(body);
-                    if (doc.RootElement.TryGetProperty("contentLink", out var cl) &&
-                        cl.TryGetProperty("id", out var idProp) &&
-                        idProp.ValueKind == JsonValueKind.Number)
-                        return idProp.GetInt32();
-                }
-                catch { }
-                return null;
-            }
+            if (response.IsSuccess)
+                return ExtractContentLinkId(body);
 
-            if (response.StatusCode == System.Net.HttpStatusCode.BadRequest)
+            if (response.Status == HttpStatusCode.BadRequest)
             {
                 var unknownProp = ExtractPropertyNotFoundName(body);
                 if (unknownProp != null)
@@ -2457,7 +2209,7 @@ public class ContentTransferService : IContentTransferService
                     // repeats, the property is nested (not at root level) so StripNamedProperty
                     // was a no-op. Throw the real error rather than looping indefinitely.
                     if (!strippedProps.Add(unknownProp))
-                        throw new HttpRequestException($"HTTP {(int)response.StatusCode}: {body}");
+                        throw new HttpRequestException($"HTTP {(int)response.Status}: {body}");
 
                     _logger.LogDebug("Stripping unknown property '{Prop}' from {Guid} and retrying", unknownProp, guid);
                     activeJson = StripNamedProperty(activeJson, unknownProp);
@@ -2473,12 +2225,12 @@ public class ContentTransferService : IContentTransferService
                     // PropertyBlock. StripNamedProperty would be a no-op and we'd loop
                     // forever — throw the real error instead so the caller gets a clear message.
                     if (propJson == null)
-                        throw new HttpRequestException($"HTTP {(int)response.StatusCode}: {body}");
+                        throw new HttpRequestException($"HTTP {(int)response.Status}: {body}");
 
                     // If we've already tried this property and still get the same error the
                     // strip didn't take effect — bail rather than looping.
                     if (!strippedProps.Add(requiredProp))
-                        throw new HttpRequestException($"HTTP {(int)response.StatusCode}: {body}");
+                        throw new HttpRequestException($"HTTP {(int)response.Status}: {body}");
 
                     // Try to substitute a fallback value so the content can be written.
                     // Page references → site root; block/media references → placeholder copy.
@@ -2523,17 +2275,17 @@ public class ContentTransferService : IContentTransferService
                 }
             }
 
-            if (response.StatusCode == System.Net.HttpStatusCode.Conflict)
+            if (response.Status == HttpStatusCode.Conflict)
             {
                 // Content already exists on target under a different parent — use the existing version.
                 _logger.LogDebug("{Guid} already exists on target with a different parent (InvalidParent) — reusing existing", guid);
                 return await GetTargetContentIdAsync(guid, target, token);
             }
 
-            throw new HttpRequestException($"HTTP {(int)response.StatusCode}: {body}");
+            throw new HttpRequestException($"HTTP {(int)response.Status}: {body}");
         }
 
-        throw new HttpRequestException("Write failed after stripping multiple unknown properties");
+        throw new HttpRequestException($"Write failed after {MaxWriteAttempts} attempts resolving property errors");
     }
 
     private (Guid? guid, string path) GetSiteRootFallback()
@@ -2548,17 +2300,6 @@ public class ContentTransferService : IContentTransferService
         catch { return (null, null); }
     }
 
-    private bool IsSiteRootGuid(Guid guid)
-    {
-        try
-        {
-            var startRef = SiteDefinition.Current?.StartPage ?? ContentReference.StartPage;
-            if (ContentReference.IsNullOrEmpty(startRef)) return false;
-            return _contentLoader.Get<IContent>(startRef, LanguageSelector.AutoDetect(true)).ContentGuid == guid;
-        }
-        catch { return false; }
-    }
-
     private static DxpEnvironmentConfig ResolveEnvironment(DxpTransferSettings settings, string name) =>
         name?.ToLowerInvariant() switch
         {
@@ -2568,15 +2309,5 @@ public class ContentTransferService : IContentTransferService
             _ => null
         };
 
-    private static ContentReference ParseContentReference(string id)
-    {
-        if (string.IsNullOrWhiteSpace(id))
-            return ContentReference.EmptyReference;
-
-        var parts = id.Split('_', ':');
-        if (int.TryParse(parts[0], out var contentId))
-            return new ContentReference(contentId);
-
-        return ContentReference.EmptyReference;
-    }
+    private static ContentReference ParseContentReference(string id) => ContentReferenceParser.Parse(id);
 }

@@ -20,7 +20,8 @@ public class EnvironmentTokenService : IEnvironmentTokenService
 
     public async Task<string> GetTokenAsync(DxpEnvironmentConfig config)
     {
-        var cacheKey = $"dxp_token_{config.BaseUrl}";
+        // Key on BaseUrl + ClientKey so rotating the client credentials doesn't serve a stale token.
+        var cacheKey = $"dxp_token_{config.BaseUrl}_{config.ClientKey}";
 
         if (_cache.TryGetValue(cacheKey, out string cachedToken))
         {
@@ -31,9 +32,6 @@ public class EnvironmentTokenService : IEnvironmentTokenService
         var client = _httpClientFactory.CreateClient();
         var tokenUrl = $"{config.BaseUrl.TrimEnd('/')}/api/episerver/connect/token";
 
-        var formBody = $"grant_type=client_credentials&client_id={Uri.EscapeDataString(config.ClientKey)}&client_secret=[redacted]&scope=epi_content_management";
-        _logger.LogDebug(">>> POST {TokenUrl}\n    Purpose: Acquiring OAuth2 client_credentials token for {Env}\n    Content-Type: application/x-www-form-urlencoded\n{FormBody}", tokenUrl, config.Name, formBody);
-
         var form = new Dictionary<string, string>
         {
             ["grant_type"] = "client_credentials",
@@ -41,6 +39,9 @@ public class EnvironmentTokenService : IEnvironmentTokenService
             ["client_secret"] = config.ClientSecret,
             ["scope"] = "epi_content_management"
         };
+
+        _logger.LogDebug(">>> POST {TokenUrl}\n    Purpose: Acquiring OAuth2 client_credentials token for {Env}\n    Content-Type: application/x-www-form-urlencoded\n    grant_type=client_credentials&client_id={ClientId}&client_secret=[redacted]&scope=epi_content_management",
+            tokenUrl, config.Name, config.ClientKey);
 
         var response = await client.PostAsync(tokenUrl, new FormUrlEncodedContent(form));
         var json = await response.Content.ReadAsStringAsync();

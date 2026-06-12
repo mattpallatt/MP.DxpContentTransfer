@@ -14,6 +14,7 @@ public static class ServiceCollectionExtensions
 
         services.AddSingleton<IDxpSettingsService, DxpSettingsService>();
         services.AddSingleton<IEnvironmentTokenService, EnvironmentTokenService>();
+        services.AddSingleton<CmaClient>();
         services.AddScoped<IContentTransferService, ContentTransferService>();
 
         services.Configure<ProtectedModuleOptions>(opts =>

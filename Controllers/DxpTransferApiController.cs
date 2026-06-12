@@ -147,19 +147,6 @@ public class DxpTransferApiController : ControllerBase
     private string DetectSourceEnvironment()
     {
         var host = _httpContextAccessor.HttpContext?.Request.Host.Host ?? string.Empty;
-        var settings = _settingsService.Get();
-        var envs = new[] {
-            ("integration", settings.Integration),
-            ("preproduction", settings.Preproduction),
-            ("production", settings.Production)
-        };
-        foreach (var (name, config) in envs)
-        {
-            if (config?.IsConfigured != true) continue;
-            if (Uri.TryCreate(config.BaseUrl, UriKind.Absolute, out var uri) &&
-                string.Equals(uri.Host, host, StringComparison.OrdinalIgnoreCase))
-                return name;
-        }
-        return null;
+        return _settingsService.Get().DetectByHost(host)?.Name;
     }
 }

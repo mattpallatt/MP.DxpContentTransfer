@@ -40,7 +40,7 @@ public class DxpGadgetController : Controller
         var contentId = Request.Query["id"].ToString();
         var settings = _settingsService.Get();
         var currentHost = _httpContextAccessor.HttpContext?.Request.Host.Host ?? string.Empty;
-        var currentEnv = DetectCurrentEnvironment(settings, currentHost);
+        var currentEnv = settings.DetectByHost(currentHost)?.Name;
 
         var (contentName, isPage, isPublished) = ResolveContentInfo(contentId);
 
@@ -67,13 +67,13 @@ public class DxpGadgetController : Controller
         if (string.IsNullOrWhiteSpace(contentId))
             return ("(no page selected)", false, false);
 
-        var parts = contentId.Split('_', ':');
-        if (!int.TryParse(parts[0], out var id))
+        var reference = ContentReferenceParser.Parse(contentId);
+        if (ContentReference.IsNullOrEmpty(reference))
             return (contentId, false, false);
 
         try
         {
-            var content = _contentLoader.Get<IContent>(new ContentReference(id));
+            var content = _contentLoader.Get<IContent>(reference);
             var isPage = content is PageData;
             var isPublished = !(content is IVersionable v) || v.Status == VersionStatus.Published;
             return (content?.Name ?? contentId, isPage, isPublished);
@@ -82,25 +82,5 @@ public class DxpGadgetController : Controller
         {
             return (contentId, false, false);
         }
-    }
-
-    private static string DetectCurrentEnvironment(DxpTransferSettings settings, string currentHost)
-    {
-        if (string.IsNullOrWhiteSpace(currentHost))
-            return null;
-
-        foreach (var env in settings.AllEnvironments)
-        {
-            if (string.IsNullOrWhiteSpace(env.BaseUrl))
-                continue;
-
-            if (Uri.TryCreate(env.BaseUrl, UriKind.Absolute, out var uri) &&
-                string.Equals(uri.Host, currentHost, StringComparison.OrdinalIgnoreCase))
-            {
-                return env.Name;
-            }
-        }
-
-        return null;
     }
 }
