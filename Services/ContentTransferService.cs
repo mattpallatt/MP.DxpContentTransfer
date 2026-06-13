@@ -1891,6 +1891,19 @@ public class ContentTransferService : IContentTransferService
         return null;
     }
 
+    // Detects {"code":"ContentNotVersionable",...} — the CMA rejects status/startPublish/
+    // stopPublish on content types that aren't versionable (some blocks and folders).
+    private static bool IsContentNotVersionable(string errorBody)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(errorBody);
+            return doc.RootElement.TryGetProperty("code", out var code) &&
+                   string.Equals(code.GetString(), "ContentNotVersionable", StringComparison.OrdinalIgnoreCase);
+        }
+        catch { return false; }
+    }
+
     // Returns the first content GUID referenced inside a CMA property value node,
     // so the deferred-patch pass can check whether that content now exists on the target.
     private static Guid? ExtractReferencedContentGuid(string propertyJson)
@@ -2191,6 +2204,7 @@ public class ContentTransferService : IContentTransferService
     {
         var activeJson = contentJson;
         var strippedProps = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var versioningStripped = false;
 
         for (var attempt = 0; attempt < MaxWriteAttempts; attempt++)
         {
@@ -2272,6 +2286,23 @@ public class ContentTransferService : IContentTransferService
                     }
                     activeJson = StripNamedProperty(activeJson, requiredProp);
                     continue;
+                }
+
+                // Non-versionable content (some blocks/folders) rejects status/startPublish/
+                // stopPublish. Those only apply to versionable content, so strip them and retry.
+                if (!versioningStripped && IsContentNotVersionable(body))
+                {
+                    versioningStripped = true;
+                    var node = JsonNode.Parse(activeJson)?.AsObject();
+                    if (node != null)
+                    {
+                        node.Remove("status");
+                        node.Remove("startPublish");
+                        node.Remove("stopPublish");
+                        activeJson = node.ToJsonString();
+                        _logger.LogDebug("{Guid} is not versionable — retrying without status/startPublish/stopPublish", guid);
+                        continue;
+                    }
                 }
             }
 
