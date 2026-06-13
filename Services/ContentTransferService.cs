@@ -29,7 +29,7 @@ public class ContentTransferService : IContentTransferService
 
     // Bumped whenever behaviour changes, and logged at the start of every pre-check/transfer so the
     // running build can be confirmed from the logs. Keep in sync with the package version.
-    private const string BuildMarker = "0.3.0 (inline-image fixes: edit-mode URL + ,,id resolve, routeSegment, markup rewrite)";
+    private const string BuildMarker = "0.3.1 (inline-image fixes + ,,sourceId→,,targetId remap)";
 
     public ContentTransferService(
         IDxpSettingsService settingsService,
@@ -948,6 +948,9 @@ public class ContentTransferService : IContentTransferService
         // Asset bucket now exists. Upload deferred local media, then XHTML inline images.
         var postIdMap = new Dictionary<Guid, int?>();
         var xhtmlUrlMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        // Editor inline-image URLs embed the source content's integer id as ",,{id}". That id is
+        // environment-specific, so remap it to the target id once the media exists on the target.
+        var xhtmlContentIdMap = new Dictionary<int, int>();
         var deferredMediaUrls = new Dictionary<Guid, string>();
 
         foreach (var (refGuid, refJson) in deferredLocalMedia)
@@ -1022,6 +1025,7 @@ public class ContentTransferService : IContentTransferService
                 if (string.IsNullOrEmpty(existingUrl))
                     existingUrl = await GetSourceContentUrlAsync(imageGuid.Value, sourceBaseUrl, sourceToken);
                 if (!string.IsNullOrEmpty(existingUrl)) xhtmlUrlMap[relPath] = existingUrl;
+                await RecordInlineImageIdRemapAsync(relPath, imageGuid.Value, target, targetToken, xhtmlContentIdMap);
                 continue;
             }
 
@@ -1069,6 +1073,7 @@ public class ContentTransferService : IContentTransferService
                 {
                     _logger.LogWarning("Uploaded XHTML image {Guid} but could not determine its target URL to rewrite the markup", imageGuid.Value);
                 }
+                await RecordInlineImageIdRemapAsync(relPath, imageGuid.Value, target, targetToken, xhtmlContentIdMap);
                 onItemComplete?.Invoke();
             }
             catch (Exception ex)
@@ -1081,11 +1086,12 @@ public class ContentTransferService : IContentTransferService
 
         // ── Step 4: Second PUT if anything was uploaded post-step-2 ──────────
         // onItemComplete fires here (after all work for this item is truly done).
-        if (postIdMap.Count > 0 || xhtmlUrlMap.Count > 0)
+        if (postIdMap.Count > 0 || xhtmlUrlMap.Count > 0 || xhtmlContentIdMap.Count > 0)
         {
             var patchedJson = baseJson;
             if (postIdMap.Count > 0) patchedJson = InjectTargetContentIds(patchedJson, postIdMap);
-            if (xhtmlUrlMap.Count > 0) patchedJson = RewriteXhtmlUrls(patchedJson, sourceBaseUrl, xhtmlUrlMap);
+            if (xhtmlUrlMap.Count > 0 || xhtmlContentIdMap.Count > 0)
+                patchedJson = RewriteXhtmlUrls(patchedJson, sourceBaseUrl, xhtmlUrlMap, xhtmlContentIdMap);
             var result = await WriteToTargetAsync(targetGuid, patchedJson, target, targetToken, deferredPatches, sourceBaseUrl, sourceToken);
             onItemComplete?.Invoke();
             return result;
@@ -1317,6 +1323,20 @@ public class ContentTransferService : IContentTransferService
         }
         catch (Exception ex) { _logger.LogDebug("Local URL resolve failed for {Path}: {Error}", relPath, ex.Message); }
         return null;
+    }
+
+    // Records a ",,{sourceId}" → ",,{targetId}" remap for an inline image whose URL carries the
+    // source content's integer id. The id is environment-specific, so the markup must be updated
+    // to the target id (the GUID is preserved across environments, so look the target id up by it).
+    private async Task RecordInlineImageIdRemapAsync(
+        string relPath, Guid imageGuid, DxpEnvironmentConfig target, string targetToken, Dictionary<int, int> map)
+    {
+        var m = Regex.Match(relPath ?? "", @",,(\d+)");
+        if (!m.Success || !int.TryParse(m.Groups[1].Value, out var sourceId) || map.ContainsKey(sourceId))
+            return;
+        var targetId = await GetTargetContentIdAsync(imageGuid, target, targetToken);
+        if (targetId.HasValue && targetId.Value != sourceId)
+            map[sourceId] = targetId.Value;
     }
 
     // EPiServer embeds the content id in editor media URLs as ",,{id}" (e.g. image.jpg,,108).
@@ -1627,20 +1647,22 @@ public class ContentTransferService : IContentTransferService
     // resolve correctly on any target environment.
     // xhtmlUrlMap (optional): source relative path → target relative path. Applied after stripping
     // the origin so that bucket-GUID mismatches between environments are fixed up.
-    private static string RewriteXhtmlUrls(string json, string sourceBaseUrl, Dictionary<string, string> xhtmlUrlMap = null)
+    private static string RewriteXhtmlUrls(string json, string sourceBaseUrl,
+        Dictionary<string, string> xhtmlUrlMap = null, Dictionary<int, int> contentIdMap = null)
     {
         var node = JsonNode.Parse(json)?.AsObject();
         if (node == null) return json;
         try
         {
             var origin = new Uri(sourceBaseUrl).GetLeftPart(UriPartial.Authority);
-            RewriteXhtmlNodes(node, origin, xhtmlUrlMap);
+            RewriteXhtmlNodes(node, origin, xhtmlUrlMap, contentIdMap);
         }
         catch { }
         return node.ToJsonString();
     }
 
-    private static void RewriteXhtmlNodes(JsonNode node, string origin, Dictionary<string, string> xhtmlUrlMap = null) =>
+    private static void RewriteXhtmlNodes(JsonNode node, string origin,
+        Dictionary<string, string> xhtmlUrlMap = null, Dictionary<int, int> contentIdMap = null) =>
         WalkJsonObjects(node, obj =>
         {
             if (obj["propertyDataType"]?.GetValue<string>() != "PropertyXhtmlString" ||
@@ -1655,6 +1677,11 @@ public class ContentTransferService : IContentTransferService
                     foreach (var (src, tgt) in xhtmlUrlMap)
                         if (!string.IsNullOrEmpty(src) && !string.IsNullOrEmpty(tgt))
                             html = html.Replace(src, tgt, StringComparison.OrdinalIgnoreCase);
+                // Remap the environment-specific ",,{id}" content id embedded in editor media URLs.
+                // Bounded by a non-digit lookahead so ",,105" never matches inside ",,1050".
+                if (contentIdMap != null)
+                    foreach (var (sourceId, targetId) in contentIdMap)
+                        html = Regex.Replace(html, $",,{sourceId}(?=\\D|$)", $",,{targetId}");
                 obj["value"] = html;
             }
             catch { }
