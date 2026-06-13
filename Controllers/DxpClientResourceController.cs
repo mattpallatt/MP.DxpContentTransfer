@@ -18,17 +18,19 @@ public class DxpClientResourceController : Controller
 
     // The admin tools menu item points at the SPA hash route "#/DxpTransfer/Settings". The admin
     // SPA has no handler for that route, so on its own it shows a blank content area. This script
-    // watches the hash and, when it matches, drops a full-area iframe over the content region
-    // pointing at the standalone settings page (DxpSettingsController). It hides the iframe again
-    // when the user navigates anywhere else.
+    // watches the hash and, when it matches, positions an iframe of the standalone settings page
+    // (DxpSettingsController) directly over the admin content pane — leaving the tools menu on the
+    // left visible — and hides it again when the user navigates anywhere else.
     private const string AdminInitScript = """
     (function () {
         var ROUTE = '#/DxpTransfer/Settings';
         var FRAME_ID = 'dxp-settings-frame';
         var SETTINGS_URL = '/EPiServer/DxpContentTransfer/Admin/Settings';
+        // The admin content pane (sibling of the tools menu). Anchoring the iframe to this element
+        // keeps the left-hand navigation visible instead of covering the whole window.
+        var CONTENT_SELECTOR = '.content-area-container';
+        var trackTimer = null;
 
-        // Height of the platform navigation bar, so the iframe sits below it rather than
-        // covering the only chrome the user can use to navigate away. Falls back to 48px.
         function topOffset() {
             var nav = document.querySelector(
                 '.epi-navigation, #epi-shellHeader, [class*="shellHeader"], [class*="GlobalNavigation"], header[role="banner"]');
@@ -36,13 +38,32 @@ public class DxpClientResourceController : Controller
             return bottom > 0 ? bottom : 48;
         }
 
-        // Size via explicit top + height. Relying on bottom:0 to stretch fails when an ancestor
-        // in the admin shell is transformed (which re-bases position:fixed), collapsing the
-        // iframe to its default ~150px height — which renders the page as a banner at the top.
+        function contentRect() {
+            var el = document.querySelector(CONTENT_SELECTOR);
+            if (el) {
+                var r = el.getBoundingClientRect();
+                if (r.width > 100 && r.height > 100) return r;
+            }
+            return null;
+        }
+
+        // Position the iframe over the content pane when we can find it; otherwise fall back to
+        // filling the area below the platform nav bar. Uses viewport coordinates with
+        // position:fixed so it stays aligned regardless of inner scrolling.
         function applyGeometry(frame) {
-            var t = topOffset();
-            frame.style.top = t + 'px';
-            frame.style.height = 'calc(100vh - ' + t + 'px)';
+            var r = contentRect();
+            if (r) {
+                frame.style.top = r.top + 'px';
+                frame.style.left = r.left + 'px';
+                frame.style.width = r.width + 'px';
+                frame.style.height = r.height + 'px';
+            } else {
+                var t = topOffset();
+                frame.style.top = t + 'px';
+                frame.style.left = '0';
+                frame.style.width = '100vw';
+                frame.style.height = 'calc(100vh - ' + t + 'px)';
+            }
         }
 
         function showFrame() {
@@ -52,17 +73,22 @@ public class DxpClientResourceController : Controller
                 frame.id = FRAME_ID;
                 frame.src = SETTINGS_URL;
                 frame.title = 'DXP Content Transfer Settings';
-                frame.style.cssText =
-                    'position:fixed;left:0;width:100vw;border:0;z-index:2147483000;background:#fff;';
+                frame.style.cssText = 'position:fixed;border:0;z-index:2147483000;background:#fff;';
                 document.body.appendChild(frame);
             }
             applyGeometry(frame);
             frame.style.display = 'block';
+            // Keep the iframe aligned as the SPA finishes laying out, the menu collapses, etc.
+            if (!trackTimer) trackTimer = setInterval(function () {
+                var f = document.getElementById(FRAME_ID);
+                if (f && f.style.display !== 'none') applyGeometry(f);
+            }, 300);
         }
 
         function hideFrame() {
             var frame = document.getElementById(FRAME_ID);
             if (frame) frame.style.display = 'none';
+            if (trackTimer) { clearInterval(trackTimer); trackTimer = null; }
         }
 
         function sync() {
@@ -82,7 +108,7 @@ public class DxpClientResourceController : Controller
             sync();
 
         // The admin SPA paints asynchronously; re-sync a few times so a deep-link straight to
-        // the route still renders once the shell (and its header) have finished loading.
+        // the route still renders once the shell has finished loading.
         [250, 750, 1500].forEach(function (ms) { setTimeout(sync, ms); });
     })();
     """;
