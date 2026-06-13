@@ -2190,8 +2190,9 @@ public class ContentTransferService : IContentTransferService
         {
             using var doc = JsonDocument.Parse(sourceJson);
             var root = doc.RootElement;
-            if (root.TryGetProperty("name", out var nameProp))
-                name = nameProp.GetString();
+            // Media names must carry a file extension or the CMA rejects the write with
+            // "File extension must be given" — editors sometimes name media without one.
+            name = ResolveAssetFileName(root);
             if (root.TryGetProperty("contentType", out var ct) && ct.ValueKind == JsonValueKind.Array)
             {
                 // Take the last (most-specific) type — e.g. ["Image","Media","ImageFile"] → "ImageFile"
@@ -2233,13 +2234,52 @@ public class ContentTransferService : IContentTransferService
         try
         {
             using var doc = JsonDocument.Parse(json);
-            if (doc.RootElement.TryGetProperty("name", out var name) &&
-                name.ValueKind == JsonValueKind.String)
-                return name.GetString();
+            return ResolveAssetFileName(doc.RootElement);
         }
         catch { }
         return null;
     }
+
+    // Returns the media item's name guaranteed to carry a file extension. The content Name is
+    // used as-is when it already has one; otherwise the extension is recovered from the
+    // routeSegment, then the url, then the mimeType.
+    private static string ResolveAssetFileName(JsonElement root)
+    {
+        var name = root.TryGetProperty("name", out var n) && n.ValueKind == JsonValueKind.String
+            ? n.GetString() : null;
+        if (!string.IsNullOrEmpty(name) && Path.HasExtension(name)) return name;
+
+        string ext = null;
+        if (root.TryGetProperty("routeSegment", out var rs) && rs.ValueKind == JsonValueKind.String)
+            ext = Path.GetExtension(rs.GetString() ?? "");
+        if (string.IsNullOrEmpty(ext) && root.TryGetProperty("url", out var u) && u.ValueKind == JsonValueKind.String)
+            ext = Path.GetExtension((u.GetString() ?? "").Split('?')[0]);
+        if (string.IsNullOrEmpty(ext))
+        {
+            var mime = root.TryGetProperty("mimeType", out var mt) &&
+                       mt.TryGetProperty("value", out var mv) && mv.ValueKind == JsonValueKind.String
+                ? mv.GetString() : null;
+            ext = ExtensionForMimeType(mime);
+        }
+        if (string.IsNullOrEmpty(name)) name = "asset";
+        return string.IsNullOrEmpty(ext) ? name : name + ext;
+    }
+
+    private static string ExtensionForMimeType(string mimeType) => mimeType?.ToLowerInvariant() switch
+    {
+        "image/jpeg" or "image/jpg" => ".jpg",
+        "image/png" => ".png",
+        "image/gif" => ".gif",
+        "image/webp" => ".webp",
+        "image/svg+xml" => ".svg",
+        "image/bmp" => ".bmp",
+        "image/tiff" => ".tiff",
+        "image/x-icon" or "image/vnd.microsoft.icon" => ".ico",
+        "image/avif" => ".avif",
+        "image/heic" => ".heic",
+        "application/pdf" => ".pdf",
+        _ => null
+    };
 
     private async Task<int?> WriteToTargetAsync(Guid guid, string contentJson, DxpEnvironmentConfig target, string token,
         List<(Guid guid, string property, string json)> deferredPatches = null,
