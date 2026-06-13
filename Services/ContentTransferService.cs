@@ -990,6 +990,9 @@ public class ContentTransferService : IContentTransferService
                 // handles permanent links and edit-mode/friendly content URLs the API won't.
                 if (!imageGuid.HasValue)
                     imageGuid = TryResolveLocalContentGuid(pathForLookup);
+                // Last resort: resolve the ",,{id}" content id embedded in editor media URLs.
+                if (!imageGuid.HasValue)
+                    imageGuid = TryResolveByEmbeddedContentId(relPath);
             }
             catch { continue; }
 
@@ -1295,6 +1298,22 @@ public class ContentTransferService : IContentTransferService
             if (content != null) return content.ContentGuid;
         }
         catch (Exception ex) { _logger.LogDebug("Local URL resolve failed for {Path}: {Error}", relPath, ex.Message); }
+        return null;
+    }
+
+    // EPiServer embeds the content id in editor media URLs as ",,{id}" (e.g. image.jpg,,108).
+    // When URL-based resolution fails, load that id locally (the gadget runs on the source) to
+    // get the GUID. Runs on the IContentLoader, consistent with the other local lookups here.
+    private Guid? TryResolveByEmbeddedContentId(string path)
+    {
+        var m = Regex.Match(path ?? "", @",,(\d+)");
+        if (!m.Success || !int.TryParse(m.Groups[1].Value, out var id)) return null;
+        try
+        {
+            var content = _contentLoader.Get<IContent>(new ContentReference(id), LanguageSelector.AutoDetect(true));
+            if (content != null && content.ContentGuid != Guid.Empty) return content.ContentGuid;
+        }
+        catch (Exception ex) { _logger.LogDebug("Could not resolve embedded content id {Id}: {Error}", id, ex.Message); }
         return null;
     }
 
