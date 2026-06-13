@@ -26,6 +26,24 @@ on transitive EPiServer dependencies (Newtonsoft.Json, ImageSharp, etc.) — not
 There is no test project and no running host here, so "verify" means: it compiles, plus manual
 testing against a live DXP environment for behavioral changes.
 
+## Host site requirements (for the CMS that consumes this package)
+
+The transfer reads source content over the **Content Management API (CMA)** and resolves URLs
+over the **Content Delivery API (CDV)** — even for the environment it runs on — so the consuming
+site must expose both, with OAuth. Missing pieces seen in the wild:
+
+- `EPiServer.ContentManagementApi` package + `services.AddContentManagementApi(OpenIDConnectOptionsDefaults.AuthenticationScheme)`.
+  Without it, `/api/episerver/v3.0/contentmanagement/{guid}` 404s and every source read fails.
+- `EPiServer.ContentDeliveryApi.Cms` + `services.AddContentDeliveryApi()`.
+- `services.AddOpenIDConnect<TUser>(...)` with an application that has the `epi_content_management`
+  scope (the gadget authenticates with `client_credentials`).
+- **`app.UseCors()` between `app.UseRouting()` and `app.UseEndpoints()`.** The OpenIDConnect token
+  endpoint carries CORS metadata; without the middleware every `/connect/token` request 500s with
+  "contains CORS metadata, but a middleware was not found that supports CORS".
+
+The gadget logs a `build {version}` line at the start of every pre-check/transfer (see `BuildMarker`)
+so the running build can be confirmed from the logs; keep it in sync with the package `Version`.
+
 ## Architecture
 
 - `Controllers/DxpGadgetController` — renders the editor gadget (`Views/DxpGadget/Index.cshtml`,
@@ -70,3 +88,20 @@ testing against a live DXP environment for behavioral changes.
 - Empty `catch {}` around best-effort URL/JSON probes is intentional (not-found is normal control
   flow). Catches around content/parent loads log at Debug. Don't promote those to Warning — it
   floods the log on the folder-existence checks.
+- **Inline images in XHTML are the fiddly part** (`TransferItemCoreAsync` step 3). The editor stores
+  `<img src>` as an internal edit-mode URL like
+  `/EPiServer/CMS/Content/globalassets/en/foo/bar.jpg,,105?epieditmode=false`, where `,,105` is the
+  **source** integer content id (environment-specific). The pipeline:
+  1. `NormalizeInlineImagePath` decodes, drops the query/`,,version`, and rewrites the
+     `/EPiServer/CMS/Content` prefix to its friendly form for lookup.
+  2. Resolution order: CDV by friendly URL → local `IUrlResolver.Route` → `TryResolveByEmbeddedContentId`
+     (loads the `,,{id}` locally via `IContentLoader`).
+  3. The media write preserves the source `routeSegment` (`BuildMinimalAssetJson`) so the target keeps
+     the same URL, and `ResolveAssetFileName` guarantees the name has a file extension (the CMA rejects
+     media without one: "File extension must be given").
+  4. The markup is rewritten two ways (both run; whichever matches wins): the full src → friendly URL
+     (`xhtmlUrlMap`), and `,,{sourceId}` → `,,{targetId}` (`RecordInlineImageIdRemapAsync` +
+     `RewriteXhtmlNodes`), since the editor bakes the source integer id into the stored URL.
+- **`ContentNotVersionable` on write** (some blocks/folders): the CMA rejects `status`/`startPublish`/
+  `stopPublish` on non-versionable content. `WriteToTargetAsync` detects this code and retries once
+  with those fields stripped — don't remove that branch.
