@@ -1012,7 +1012,10 @@ public class ContentTransferService : IContentTransferService
                     existingUrl = cachedUrl;
                 else
                     existingUrl = await GetTargetContentUrlViaCdvAsync(imageGuid.Value, target, targetToken);
-                if (existingUrl != null) xhtmlUrlMap[relPath] = existingUrl;
+                // Same fallback as the upload branch: the source canonical path equals the target URL.
+                if (string.IsNullOrEmpty(existingUrl))
+                    existingUrl = await GetSourceContentUrlAsync(imageGuid.Value, sourceBaseUrl, sourceToken);
+                if (!string.IsNullOrEmpty(existingUrl)) xhtmlUrlMap[relPath] = existingUrl;
                 continue;
             }
 
@@ -1046,10 +1049,19 @@ public class ContentTransferService : IContentTransferService
                 var (_, targetRelUrl) = await WriteAssetToTargetAsync(imageGuid.Value, imgJson, imgStub, sourceToken, target, targetToken);
                 if (targetRelUrl == null)
                     targetRelUrl = await GetTargetContentUrlViaCdvAsync(imageGuid.Value, target, targetToken);
-                if (targetRelUrl != null)
+                // The source canonical path equals the target URL for global/page-local media (the
+                // routeSegment is preserved and globalassets/contentassets paths match across
+                // environments), so fall back to it when the target URL can't be read back —
+                // otherwise the rewrite is skipped and the editor's edit-mode src is left in place.
+                if (string.IsNullOrEmpty(targetRelUrl)) targetRelUrl = canonicalPath;
+                if (!string.IsNullOrEmpty(targetRelUrl))
                 {
                     xhtmlUrlMap[relPath] = targetRelUrl;
                     _logger.LogDebug("XHTML image {Guid}: {Src} → {Tgt}", imageGuid.Value, relPath, targetRelUrl);
+                }
+                else
+                {
+                    _logger.LogWarning("Uploaded XHTML image {Guid} but could not determine its target URL to rewrite the markup", imageGuid.Value);
                 }
                 onItemComplete?.Invoke();
             }
