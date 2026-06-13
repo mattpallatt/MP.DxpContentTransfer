@@ -2186,6 +2186,7 @@ public class ContentTransferService : IContentTransferService
     {
         string name = null;
         string leafContentType = null;
+        string routeSegment = null;
         try
         {
             using var doc = JsonDocument.Parse(sourceJson);
@@ -2193,6 +2194,10 @@ public class ContentTransferService : IContentTransferService
             // Media names must carry a file extension or the CMA rejects the write with
             // "File extension must be given" — editors sometimes name media without one.
             name = ResolveAssetFileName(root);
+            // Preserve the source "Name in URL" so the media keeps the same URL on the target —
+            // inline <img> srcs reference media by this segment, not by the Name (which can differ).
+            if (root.TryGetProperty("routeSegment", out var rs) && rs.ValueKind == JsonValueKind.String)
+                routeSegment = rs.GetString();
             if (root.TryGetProperty("contentType", out var ct) && ct.ValueKind == JsonValueKind.Array)
             {
                 // Take the last (most-specific) type — e.g. ["Image","Media","ImageFile"] → "ImageFile"
@@ -2209,6 +2214,8 @@ public class ContentTransferService : IContentTransferService
             ["name"] = name ?? "asset",
             ["status"] = status
         };
+        if (!string.IsNullOrEmpty(routeSegment))
+            obj["routeSegment"] = routeSegment;
         if (!string.IsNullOrEmpty(leafContentType))
             obj["contentType"] = new JsonArray(leafContentType);
 
