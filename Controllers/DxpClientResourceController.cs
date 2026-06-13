@@ -26,8 +26,11 @@ public class DxpClientResourceController : Controller
         var ROUTE = '#/DxpTransfer/Settings';
         var FRAME_ID = 'dxp-settings-frame';
         var SETTINGS_URL = '/EPiServer/DxpContentTransfer/Admin/Settings';
-        // The admin content pane (sibling of the tools menu). Anchoring the iframe to this element
-        // keeps the left-hand navigation visible instead of covering the whole window.
+        // The admin side-bar navigation. It is present on every admin route (including ours),
+        // whereas the content pane (.content-area-container) is only rendered for routes the SPA
+        // recognises — not ours. So we anchor the iframe to the right edge of the side-bar, which
+        // lands it exactly where the content pane sits while keeping the left menu visible.
+        var NAV_SELECTOR = '.epi-side-bar-navigation';
         var CONTENT_SELECTOR = '.content-area-container';
         var trackTimer = null;
 
@@ -38,32 +41,40 @@ public class DxpClientResourceController : Controller
             return bottom > 0 ? bottom : 48;
         }
 
-        function contentRect() {
-            var el = document.querySelector(CONTENT_SELECTOR);
+        function rectOf(selector, minW, minH) {
+            var el = document.querySelector(selector);
             if (el) {
                 var r = el.getBoundingClientRect();
-                if (r.width > 100 && r.height > 100) return r;
+                if (r.width > minW && r.height > minH) return r;
             }
             return null;
         }
 
-        // Position the iframe over the content pane when we can find it; otherwise fall back to
-        // filling the area below the platform nav bar. Uses viewport coordinates with
-        // position:fixed so it stays aligned regardless of inner scrolling.
+        // Place the iframe in the content region using viewport coordinates (position:fixed).
+        // Preference order: beside the side-bar nav (works on our unrecognised route) → over the
+        // content pane if the SPA rendered it → full area below the platform nav bar.
         function applyGeometry(frame) {
-            var r = contentRect();
-            if (r) {
-                frame.style.top = r.top + 'px';
-                frame.style.left = r.left + 'px';
-                frame.style.width = r.width + 'px';
-                frame.style.height = r.height + 'px';
-            } else {
-                var t = topOffset();
-                frame.style.top = t + 'px';
-                frame.style.left = '0';
-                frame.style.width = '100vw';
-                frame.style.height = 'calc(100vh - ' + t + 'px)';
+            var nav = rectOf(NAV_SELECTOR, 100, 100);
+            if (nav) {
+                frame.style.top = nav.top + 'px';
+                frame.style.left = nav.right + 'px';
+                frame.style.width = Math.max(0, window.innerWidth - nav.right) + 'px';
+                frame.style.height = nav.height + 'px';
+                return;
             }
+            var content = rectOf(CONTENT_SELECTOR, 100, 100);
+            if (content) {
+                frame.style.top = content.top + 'px';
+                frame.style.left = content.left + 'px';
+                frame.style.width = content.width + 'px';
+                frame.style.height = content.height + 'px';
+                return;
+            }
+            var t = topOffset();
+            frame.style.top = t + 'px';
+            frame.style.left = '0';
+            frame.style.width = '100vw';
+            frame.style.height = 'calc(100vh - ' + t + 'px)';
         }
 
         function showFrame() {
