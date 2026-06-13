@@ -28,11 +28,21 @@ public class DxpClientResourceController : Controller
         var SETTINGS_URL = '/EPiServer/DxpContentTransfer/Admin/Settings';
 
         // Height of the platform navigation bar, so the iframe sits below it rather than
-        // covering the only chrome the user can use to navigate away. Falls back to 40px.
+        // covering the only chrome the user can use to navigate away. Falls back to 48px.
         function topOffset() {
             var nav = document.querySelector(
-                '.epi-navigation, #epi-shellHeader, [class*="shellHeader"], header[role="banner"]');
-            return nav ? Math.max(0, Math.round(nav.getBoundingClientRect().bottom)) : 40;
+                '.epi-navigation, #epi-shellHeader, [class*="shellHeader"], [class*="GlobalNavigation"], header[role="banner"]');
+            var bottom = nav ? Math.round(nav.getBoundingClientRect().bottom) : 0;
+            return bottom > 0 ? bottom : 48;
+        }
+
+        // Size via explicit top + height. Relying on bottom:0 to stretch fails when an ancestor
+        // in the admin shell is transformed (which re-bases position:fixed), collapsing the
+        // iframe to its default ~150px height — which renders the page as a banner at the top.
+        function applyGeometry(frame) {
+            var t = topOffset();
+            frame.style.top = t + 'px';
+            frame.style.height = 'calc(100vh - ' + t + 'px)';
         }
 
         function showFrame() {
@@ -43,10 +53,10 @@ public class DxpClientResourceController : Controller
                 frame.src = SETTINGS_URL;
                 frame.title = 'DXP Content Transfer Settings';
                 frame.style.cssText =
-                    'position:fixed;left:0;right:0;bottom:0;width:100%;border:0;z-index:9999;background:#fff;';
+                    'position:fixed;left:0;width:100vw;border:0;z-index:2147483000;background:#fff;';
                 document.body.appendChild(frame);
             }
-            frame.style.top = topOffset() + 'px';
+            applyGeometry(frame);
             frame.style.display = 'block';
         }
 
@@ -63,7 +73,7 @@ public class DxpClientResourceController : Controller
         window.addEventListener('hashchange', sync);
         window.addEventListener('resize', function () {
             var f = document.getElementById(FRAME_ID);
-            if (f && f.style.display !== 'none') f.style.top = topOffset() + 'px';
+            if (f && f.style.display !== 'none') applyGeometry(f);
         });
 
         if (document.readyState === 'loading')
