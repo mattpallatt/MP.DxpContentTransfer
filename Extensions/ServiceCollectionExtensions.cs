@@ -1,5 +1,7 @@
+using DxpContentTransfer.Middleware;
 using DxpContentTransfer.Services;
 using EPiServer.Shell.Modules;
+using Microsoft.AspNetCore.Hosting;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace DxpContentTransfer.Extensions;
@@ -16,6 +18,9 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IEnvironmentTokenService, EnvironmentTokenService>();
         services.AddSingleton<CmaClient>();
         services.AddScoped<IContentTransferService, ContentTransferService>();
+
+        // Inject the admin settings-page bootstrap script into admin pages automatically.
+        services.AddTransient<IStartupFilter, DxpAdminScriptStartupFilter>();
 
         services.Configure<ProtectedModuleOptions>(opts =>
         {

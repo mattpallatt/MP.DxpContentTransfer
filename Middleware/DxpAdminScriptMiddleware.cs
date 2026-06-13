@@ -39,6 +39,16 @@ public class DxpAdminScriptMiddleware(RequestDelegate next)
         }
 
         var html = await new StreamReader(buffer, Encoding.UTF8).ReadToEndAsync();
+
+        // Idempotent: if the tag is already present (e.g. the host also registered this
+        // middleware), write the body through untouched rather than injecting a second copy.
+        if (html.Contains(ScriptTag, StringComparison.OrdinalIgnoreCase))
+        {
+            buffer.Position = 0;
+            await buffer.CopyToAsync(originalBody);
+            return;
+        }
+
         var bodyClose = html.LastIndexOf("</body>", StringComparison.OrdinalIgnoreCase);
 
         if (bodyClose < 0)
