@@ -27,6 +27,10 @@ public class ContentTransferService : IContentTransferService
     // a time off the body; this bounds that loop so a persistent server error can't spin forever.
     private const int MaxWriteAttempts = 25;
 
+    // Bumped whenever behaviour changes, and logged at the start of every pre-check/transfer so the
+    // running build can be confirmed from the logs. Keep in sync with the package version.
+    private const string BuildMarker = "0.3.0 (inline-image fixes: edit-mode URL + ,,id resolve, routeSegment, markup rewrite)";
+
     public ContentTransferService(
         IDxpSettingsService settingsService,
         IEnvironmentTokenService tokenService,
@@ -51,6 +55,7 @@ public class ContentTransferService : IContentTransferService
         bool includeChildren,
         bool overwriteMatchingIds)
     {
+        _logger.LogInformation("DXP Content Transfer pre-check — build {Build}", BuildMarker);
         var settings = _settingsService.Get();
         var target = ResolveEnvironment(settings, targetEnvironmentName);
 
@@ -524,6 +529,7 @@ public class ContentTransferService : IContentTransferService
         List<PreCheckItemResult> plan = null,
         Action onItemComplete = null)
     {
+        _logger.LogInformation("DXP Content Transfer starting — build {Build}", BuildMarker);
         var settings = _settingsService.Get();
         var target = ResolveEnvironment(settings, targetEnvironmentName);
         var source = ResolveEnvironment(settings, sourceEnvironmentName);
