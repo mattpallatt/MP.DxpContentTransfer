@@ -969,8 +969,10 @@ public class ContentTransferService : IContentTransferService
         {
             var relPath = ToRelativePath(srcUrl);
             if (string.IsNullOrEmpty(relPath)) continue;
-            var pathForLookup = relPath.Split('?')[0];
-            if (!seenImagePaths.Add(pathForLookup)) continue;
+            // relPath is kept as-is for the rewrite map key (it matches the raw src in the HTML);
+            // pathForLookup is normalised purely for resolving the src back to a content GUID.
+            var pathForLookup = NormalizeInlineImagePath(relPath);
+            if (string.IsNullOrEmpty(pathForLookup) || !seenImagePaths.Add(pathForLookup)) continue;
 
             var isContentAsset  = pathForLookup.StartsWith("/contentassets/", StringComparison.OrdinalIgnoreCase);
             var isGlobalAsset   = pathForLookup.StartsWith("/globalassets/",  StringComparison.OrdinalIgnoreCase);
@@ -984,7 +986,9 @@ public class ContentTransferService : IContentTransferService
             try
             {
                 imageGuid = await FindByUrlOnSourceAsync(pathForLookup, sourceBaseUrl, sourceToken);
-                if (!imageGuid.HasValue && (isEpiServer || isPermanentLink))
+                // Fall back to the local CMS router for any path the CDV can't resolve — it
+                // handles permanent links and edit-mode/friendly content URLs the API won't.
+                if (!imageGuid.HasValue)
                     imageGuid = TryResolveLocalContentGuid(pathForLookup);
             }
             catch { continue; }
@@ -1627,6 +1631,26 @@ public class ContentTransferService : IContentTransferService
         if (Uri.TryCreate(url, UriKind.Absolute, out var uri))
             return uri.PathAndQuery;
         return url.StartsWith('/') ? url : null;
+    }
+
+    private const string EditModeContentPrefix = "/EPiServer/CMS/Content";
+
+    // Turns an XHTML <img src> into a path we can resolve back to a content GUID. Editor markup
+    // commonly stores internal edit-mode URLs such as
+    //   /EPiServer/CMS/Content/globalassets/en/foo/bar.jpg,,108%3Fepieditmode=false
+    // so we: URL-decode (the query is often %3F-encoded), drop the query/fragment, strip the
+    // ",,<version>" suffix, and rewrite the edit-mode prefix to its friendly form (/globalassets/…).
+    private static string NormalizeInlineImagePath(string relPath)
+    {
+        if (string.IsNullOrEmpty(relPath)) return relPath;
+        var p = Uri.UnescapeDataString(relPath);
+        var q = p.IndexOfAny(['?', '#']);
+        if (q >= 0) p = p[..q];
+        var v = p.IndexOf(",,", StringComparison.Ordinal);
+        if (v >= 0) p = p[..v];
+        if (p.StartsWith(EditModeContentPrefix, StringComparison.OrdinalIgnoreCase))
+            p = p[EditModeContentPrefix.Length..];
+        return p;
     }
 
     private static List<Guid> ExtractContentReferenceGuids(string json)
