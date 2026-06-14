@@ -23,8 +23,19 @@ dotnet build --no-restore
 build has 0 errors / 0 `CS` warnings; the ~20 `NU19xx` warnings are pre-existing CVE advisories
 on transitive EPiServer dependencies (Newtonsoft.Json, ImageSharp, etc.) — not our code.
 
-There is no test project and no running host here, so "verify" means: it compiles, plus manual
-testing against a live DXP environment for behavioral changes.
+There is a unit-test project at `tests/DxpContentTransfer.Tests` (xUnit) covering the **pure**
+helpers — the JSON/XHTML surgery where regressions hide (id/guid remapping, property stripping,
+inline-image/fragment parsing). Those helpers are `internal static` and reached via
+`[InternalsVisibleTo]`. Run it (same dual feed as the build):
+
+```bash
+dotnet test tests/DxpContentTransfer.Tests/DxpContentTransfer.Tests.csproj
+```
+
+The `tests/` folder is excluded from the library's own compilation (`<Compile Remove="tests/**" />`)
+because the Razor SDK otherwise globs every `.cs` under the project root. There is no running host
+here, so full "verify" for behavioural changes is still: it compiles, tests pass, plus manual
+testing against a live DXP environment.
 
 ## Host site requirements (for the CMS that consumes this package)
 
@@ -53,10 +64,33 @@ so the running build can be confirmed from the logs; keep it in sync with the pa
   `Task.Run`, returns a jobId), `progress/{jobId}`, `result/{jobId}`. Job state is an in-memory
   `ConcurrentDictionary` — **it does not survive an app-pool recycle**; that's a known tradeoff.
 - `Controllers/DxpSettingsController` + `Views/DxpSettings` — admin page for per-environment
-  credentials (admin roles only).
-- `Services/ContentTransferService` — the engine (~2300 lines). Pre-check planning, the recursive
+  credentials (admin roles only). Also exposes `Admin/TestConnection` (AJAX), backed by
+  `EnvironmentHealthService`, for the per-environment "Test connection" button.
+- `Services/EnvironmentHealthService` — the "Test connection" probe: fetches a client-credentials
+  token (catches the CORS-500 / bad-secret case), checks the granted scope, then GETs the CMA for a
+  throwaway GUID. **A 404 here is SUCCESS, not failure** — a healthy CMA 404s a non-existent GUID
+  exactly as `ExistsOnTargetAsync` relies on during a transfer. (An earlier version re-probed
+  anonymously expecting a 401/403 challenge to prove the route exists — wrong: Optimizely returns 404
+  for unauthorized/unknown content, so that false-failed working environments. Don't reinstate it.)
+  Registered-but-not-found vs route-not-registered is separated only by response *shape* (a real API
+  emits a JSON/problem body; a bare framework 404 doesn't), and even a bare 404 is reported as a pass
+  with a soft advisory — never a hard fail.
+- `Services/ContentTransferService` — the engine (~2100 lines). Pre-check planning, the recursive
   stub→blocks→media→full transfer cycle, JSON property surgery, deferred forward-reference patches,
-  placeholder fabrication, URL/domain relinking.
+  placeholder fabrication, URL/domain relinking. The **pure** XHTML/JSON helpers have been lifted out
+  (see next two), leaving the stateful engine; it pulls the visitors back in via `using static`.
+- `Services/XhtmlProcessor` — pure PropertyXhtmlString processing: `ExtractXhtmlImageUrls`,
+  `ExtractXhtmlContentFragments`/`ParseContentFragments`, `RewriteXhtmlUrls`, `NormalizeInlineImagePath`,
+  `ToRelativePath`. No I/O or engine state, so it's directly unit-tested. The engine still drives it and
+  owns the resolution/upload of whatever it surfaces.
+  - **Reads parse, writes string-replace — keep it that way.** The *read* paths
+    (`ExtractXhtmlImageUrls`, `ParseContentFragments`) use **HtmlAgilityPack** to parse the markup, so
+    attribute order/quoting/whitespace can't slip an asset past. The *write* path (`RewriteXhtmlUrls`)
+    stays surgical string replacement and **must not** be "consistency-refactored" to parse→mutate→
+    re-serialise: HAP (like `XhtmlString.ToString()`) re-emits a normalised document, which mangles the
+    `epi-contentfragment` divs and `,,{id}` edit-mode suffixes the transfer depends on byte-for-byte.
+- `Services/JsonVisitors` — the three shared tree walkers (`WalkJsonObjects` / `WalkJsonElements` /
+  `MutateJsonStrings`). Imported `using static` so callers read unqualified.
 - `Services/CmaClient` — the only HTTP transport. All CMA/CDV GET/PUT go through it (URL building,
   bearer auth, logging). If you need a new API call, add a method here, don't inline `HttpClient`.
 - `Services/EnvironmentTokenService` — OAuth2 client-credentials tokens, cached per BaseUrl+ClientKey
@@ -75,8 +109,8 @@ so the running build can be confirmed from the logs; keep it in sync with the pa
      `itemContexts` list **before the first `await`**, because an await can resume on a different
      thread. New code that reads content must follow this pattern.
 - **JSON is manipulated as `System.Text.Json` trees.** For whole-document walks use the shared
-  visitors `WalkJsonObjects` / `WalkJsonElements` / `MutateJsonStrings` — don't hand-roll another
-  "if object recurse / if array recurse" method.
+  visitors `WalkJsonObjects` / `WalkJsonElements` / `MutateJsonStrings` (in `Services/JsonVisitors`,
+  imported via `using static`) — don't hand-roll another "if object recurse / if array recurse" method.
 - **CMA v3 quirks** the code deliberately works around: integer ids are environment-specific (strip
   them, the target binds by `guidValue`); media refs need the target integer id injected back;
   unknown/required properties are stripped-and-retried in a bounded loop (`MaxWriteAttempts`), with
@@ -102,6 +136,22 @@ so the running build can be confirmed from the logs; keep it in sync with the pa
   4. The markup is rewritten two ways (both run; whichever matches wins): the full src → friendly URL
      (`xhtmlUrlMap`), and `,,{sourceId}` → `,,{targetId}` (`RecordInlineImageIdRemapAsync` +
      `RewriteXhtmlNodes`), since the editor bakes the source integer id into the stored URL.
+  - Both `<img src>` **and `<a href>`** are scanned (`CollectXhtmlUrls`), so linked media (mp4, pdf…)
+    transfer too — but only content that is actually `Media` is uploaded (the `GetAssetBinaryUrl`
+    guard in the loop), so an `<a href>` to a page/block isn't created out-of-band as a bogus asset.
+- **Inline content blocks** (`<div class="epi-contentfragment" data-contentguid data-contentlink>`
+  baked into XHTML) are a second hidden-dependency case. The block guid lives only in the HTML string,
+  so `ExtractContentReferenceGuids` (a `guidValue` walker) never sees it. `ExtractXhtmlContentFragments`
+  /`ParseContentFragments` pull `(guid, contentLink, name)` out of the divs; their guids are appended to
+  the step-1 transfer enumeration so the block is created/re-PUT like any ContentArea block, and
+  `data-contentlink="{sourceId}"` is remapped to the target integer id in step 4 (`xhtmlBlockIdMap` →
+  `RewriteXhtmlNodes`). The guid is environment-stable so `data-contentguid` needs no rewrite.
+  - **Pre-check vs transfer read the XHTML differently.** The transfer reads the raw CMA JSON `value`
+    (which contains the `epi-contentfragment` divs, so the regex parser works). The pre-check has only
+    the in-process `XhtmlString`, and `XhtmlString.ToString()`/the raw long-string **does not reliably
+    carry the fragment divs** (inline `<a>`/`<img>` survive, content fragments don't) — so the pre-check
+    must walk `XhtmlString.Fragments` for `ContentFragment` (use `cf.ContentGuid` + `cf.GetContent()`)
+    to surface inline blocks as `InlineBlock` nodes. Don't switch it back to regex-on-string.
 - **`ContentNotVersionable` on write** (some blocks/folders): the CMA rejects `status`/`startPublish`/
   `stopPublish` on non-versionable content. `WriteToTargetAsync` detects this code and retries once
   with those fields stripped — don't remove that branch.

@@ -80,6 +80,7 @@
         .dep-label { font-size: 11px; font-weight: 500; color: #fff; border-radius: 3px; padding: 2px 6px; margin-left: 8px; white-space: nowrap; flex-shrink: 0; }
         .dep-label-page     { background: #5c6bc0; }
         .dep-label-block    { background: #3a7bd5; }
+        .dep-label-inlineblock { background: #1f4e9c; }
         .dep-label-image    { background: #e07820; }
         .dep-label-inline   { background: #c06010; }
         .dep-label-video    { background: #7b1fa2; }
@@ -265,7 +266,7 @@ var dxpTransfer = (function () {
             (deps || []).forEach(function (d) {
                 switch (d.nodeType) {
                     case 'Image': case 'InlineImage': counts.images++; break;
-                    case 'Block': counts.blocks++;    break;
+                    case 'Block': case 'InlineBlock': counts.blocks++; break;
                     case 'Page':  counts.pageRefs++;  break;
                     default:      counts.other++;     break; // Video, Audio, Document, UnknownMedia
                 }
@@ -537,6 +538,7 @@ var dxpTransfer = (function () {
             case 'Page':         return { text: 'page ref', cls: 'dep-label dep-label-page' };
             case 'Image':        return { text: 'image',    cls: 'dep-label dep-label-image' };
             case 'InlineImage':  return { text: 'inline',   cls: 'dep-label dep-label-inline' };
+            case 'InlineBlock':  return { text: 'inline block', cls: 'dep-label dep-label-inlineblock' };
             case 'Video':        return { text: 'video',    cls: 'dep-label dep-label-video' };
             case 'Audio':        return { text: 'audio',    cls: 'dep-label dep-label-audio' };
             case 'Document':     return { text: 'document', cls: 'dep-label dep-label-document' };
@@ -707,6 +709,7 @@ var dxpTransfer = (function () {
                 case 'Document':     return 'Document';
                 case 'UnknownMedia': return 'Media';
                 case 'Block':        return 'Block';
+                case 'InlineBlock':  return 'Inline Block';
                 default:             return nodeType || 'Asset';
             }
         }

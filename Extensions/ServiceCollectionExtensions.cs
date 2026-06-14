@@ -17,6 +17,7 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IDxpSettingsService, DxpSettingsService>();
         services.AddSingleton<IEnvironmentTokenService, EnvironmentTokenService>();
         services.AddSingleton<CmaClient>();
+        services.AddSingleton<IEnvironmentHealthService, EnvironmentHealthService>();
         services.AddScoped<IContentTransferService, ContentTransferService>();
 
         // Inject the admin settings-page bootstrap script into admin pages automatically.

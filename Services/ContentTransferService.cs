@@ -7,10 +7,12 @@ using System.Text.RegularExpressions;
 using DxpContentTransfer.Models;
 using EPiServer;
 using EPiServer.Core;
+using EPiServer.Core.Html.StringParsing;
 using EPiServer.SpecializedProperties;
 using EPiServer.Web;
 using EPiServer.Web.Routing;
 using Microsoft.Extensions.Logging;
+using static DxpContentTransfer.Services.JsonVisitors;
 
 namespace DxpContentTransfer.Services;
 
@@ -29,7 +31,7 @@ public class ContentTransferService : IContentTransferService
 
     // Bumped whenever behaviour changes, and logged at the start of every pre-check/transfer so the
     // running build can be confirmed from the logs. Keep in sync with the package version.
-    private const string BuildMarker = "0.3.1 (inline-image fixes + ,,sourceId→,,targetId remap)";
+    private const string BuildMarker = "0.5.0 (XhtmlProcessor/JsonVisitors split; HtmlAgilityPack on read paths)";
 
     public ContentTransferService(
         IDxpSettingsService settingsService,
@@ -235,7 +237,7 @@ public class ContentTransferService : IContentTransferService
             }
         }
 
-        // Scan XHTML properties for actually-referenced inline images.
+        // Scan XHTML properties for actually-referenced inline assets (img src + a href).
         // Use type-name detection + PropertyLongString.LongString to get the raw stored XHTML
         // without requiring an HTTP context (which XhtmlString.ToHtmlString() may need).
         var seenInlineUrls = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -246,12 +248,13 @@ public class ContentTransferService : IContentTransferService
             var typeName = prop.GetType().Name;
             if (!typeName.Contains("Xhtml", StringComparison.OrdinalIgnoreCase)) continue;
 
+            var xhtml = prop.Value as XhtmlString;
             string html = null;
             try
             {
                 // Try value cast first
-                if (prop.Value is XhtmlString xs)
-                    html = xs.ToString();
+                if (xhtml != null)
+                    html = xhtml.ToString();
                 // Fallback: ToString() on the property itself (PropertyData.ToString() calls Value.ToString())
                 if (string.IsNullOrEmpty(html))
                     html = prop.Value?.ToString();
@@ -269,9 +272,28 @@ public class ContentTransferService : IContentTransferService
             }
 
             _logger.LogDebug("Pre-check XHTML prop '{Content}'.{Prop}({Type}): {Len} chars", contentName, prop.Name, typeName, html?.Length ?? -1);
+
+            // Inline content blocks (epi-contentfragment divs). XhtmlString.ToString()/the raw string
+            // doesn't reliably carry the fragment divs (anchors survive, fragments don't), but the
+            // parsed fragment list always does — so walk that directly rather than scraping markup.
+            if (xhtml != null)
+                foreach (var fragment in xhtml.Fragments)
+                {
+                    if (fragment is not ContentFragment cf || cf.ContentGuid == Guid.Empty) continue;
+                    if (!seenInlineUrls.Add("frag:" + cf.ContentGuid.ToString("D"))) continue;
+                    string fragName = null;
+                    try { fragName = cf.GetContent()?.Name; } catch { }
+                    nodes.Add(new DependencyNode
+                    {
+                        Name = fragName ?? cf.ContentGuid.ToString("D"),
+                        NodeType = "InlineBlock",
+                        ContentGuid = cf.ContentGuid.ToString("D")
+                    });
+                }
+
             if (string.IsNullOrEmpty(html)) continue;
 
-            foreach (Match m in Regex.Matches(html, @"src=""([^""]+)""", RegexOptions.IgnoreCase))
+            foreach (Match m in Regex.Matches(html, @"(?:src|href)=""([^""]+)""", RegexOptions.IgnoreCase))
             {
                 var src = m.Groups[1].Value;
                 var srcPath = src.Split('?')[0];
@@ -820,7 +842,18 @@ public class ContentTransferService : IContentTransferService
         var idMap = new Dictionary<Guid, int?>();
         var deferredLocalMedia = new List<(Guid guid, string json)>();
 
-        foreach (var refGuid in ExtractContentReferenceGuids(sourceJson))
+        // Inline content blocks (epi-contentfragment divs) reference a block by guid *inside* the
+        // XHTML string, so ExtractContentReferenceGuids — which walks guidValue JSON nodes — never
+        // sees them. Surface their guids here so they're transferred (created if new, re-PUT if they
+        // exist) exactly like a ContentArea block. data-contentlink (the source integer id) is
+        // remapped to the target id in step 4.
+        var inlineFragments = XhtmlProcessor.ExtractXhtmlContentFragments(sourceJson);
+        var refGuids = ExtractContentReferenceGuids(sourceJson);
+        foreach (var frag in inlineFragments)
+            if (frag.Guid != Guid.Empty && !refGuids.Contains(frag.Guid))
+                refGuids.Add(frag.Guid);
+
+        foreach (var refGuid in refGuids)
         {
             if (!visited.Add(refGuid))
             {
@@ -974,13 +1007,13 @@ public class ContentTransferService : IContentTransferService
         }
 
         var seenImagePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var srcUrl in ExtractXhtmlImageUrls(sourceJson))
+        foreach (var srcUrl in XhtmlProcessor.ExtractXhtmlImageUrls(sourceJson))
         {
-            var relPath = ToRelativePath(srcUrl);
+            var relPath = XhtmlProcessor.ToRelativePath(srcUrl);
             if (string.IsNullOrEmpty(relPath)) continue;
             // relPath is kept as-is for the rewrite map key (it matches the raw src in the HTML);
             // pathForLookup is normalised purely for resolving the src back to a content GUID.
-            var pathForLookup = NormalizeInlineImagePath(relPath);
+            var pathForLookup = XhtmlProcessor.NormalizeInlineImagePath(relPath);
             if (string.IsNullOrEmpty(pathForLookup) || !seenImagePaths.Add(pathForLookup)) continue;
 
             var isContentAsset  = pathForLookup.StartsWith("/contentassets/", StringComparison.OrdinalIgnoreCase);
@@ -1007,7 +1040,7 @@ public class ContentTransferService : IContentTransferService
 
             if (!imageGuid.HasValue)
             {
-                _logger.LogWarning("Could not resolve XHTML image URL to a GUID: {Url}", relPath);
+                _logger.LogWarning("Could not resolve XHTML asset URL to a GUID: {Url}", relPath);
                 continue;
             }
 
@@ -1032,6 +1065,14 @@ public class ContentTransferService : IContentTransferService
             string imgJson;
             try { imgJson = await ReadFromSourceAsync(imageGuid.Value, sourceBaseUrl, sourceToken); }
             catch { continue; }
+
+            // An <a href> can point at a page/block (in edit mode), not just an asset. Only media
+            // gets uploaded here; page/block links are left to ordinary content-link relinking.
+            if (GetAssetBinaryUrl(imgJson) == null)
+            {
+                _logger.LogDebug("Inline link {Guid} is not a media asset — skipping upload", imageGuid.Value);
+                continue;
+            }
 
             // Use the CDV canonical URL to determine where the image actually lives.
             // The XHTML src may be an EPiServer internal URL (/EPiServer/CMS/Content/globalassets/...)
@@ -1067,31 +1108,45 @@ public class ContentTransferService : IContentTransferService
                 if (!string.IsNullOrEmpty(targetRelUrl))
                 {
                     xhtmlUrlMap[relPath] = targetRelUrl;
-                    _logger.LogDebug("XHTML image {Guid}: {Src} → {Tgt}", imageGuid.Value, relPath, targetRelUrl);
+                    _logger.LogDebug("XHTML asset {Guid}: {Src} → {Tgt}", imageGuid.Value, relPath, targetRelUrl);
                 }
                 else
                 {
-                    _logger.LogWarning("Uploaded XHTML image {Guid} but could not determine its target URL to rewrite the markup", imageGuid.Value);
+                    _logger.LogWarning("Uploaded XHTML asset {Guid} but could not determine its target URL to rewrite the markup", imageGuid.Value);
                 }
                 await RecordInlineImageIdRemapAsync(relPath, imageGuid.Value, target, targetToken, xhtmlContentIdMap);
                 onItemComplete?.Invoke();
             }
             catch (Exception ex)
             {
-                _logger.LogWarning("Could not upload XHTML image {Guid}: {Error}", imageGuid.Value, ex.Message);
+                _logger.LogWarning("Could not upload XHTML asset {Guid}: {Error}", imageGuid.Value, ex.Message);
                 failedDependencyGuids?.Add(imageGuid.Value.ToString("D"));
                 onItemComplete?.Invoke();
             }
         }
 
+        // Inline content-block fragments embed the source block's integer id as data-contentlink="{id}".
+        // The block guid is environment-stable (we preserve it on transfer) so the div's data-contentguid
+        // already matches; only the integer id needs remapping to the target — otherwise it points at
+        // whatever unrelated content happens to hold that id on the target.
+        var xhtmlBlockIdMap = new Dictionary<int, int>();
+        foreach (var frag in inlineFragments)
+        {
+            if (frag.ContentLink <= 0 || xhtmlBlockIdMap.ContainsKey(frag.ContentLink)) continue;
+            int? targetId = idMap.TryGetValue(frag.Guid, out var mapped) ? mapped : null;
+            targetId ??= await GetTargetContentIdAsync(frag.Guid, target, targetToken);
+            if (targetId.HasValue && targetId.Value != frag.ContentLink)
+                xhtmlBlockIdMap[frag.ContentLink] = targetId.Value;
+        }
+
         // ── Step 4: Second PUT if anything was uploaded post-step-2 ──────────
         // onItemComplete fires here (after all work for this item is truly done).
-        if (postIdMap.Count > 0 || xhtmlUrlMap.Count > 0 || xhtmlContentIdMap.Count > 0)
+        if (postIdMap.Count > 0 || xhtmlUrlMap.Count > 0 || xhtmlContentIdMap.Count > 0 || xhtmlBlockIdMap.Count > 0)
         {
             var patchedJson = baseJson;
             if (postIdMap.Count > 0) patchedJson = InjectTargetContentIds(patchedJson, postIdMap);
-            if (xhtmlUrlMap.Count > 0 || xhtmlContentIdMap.Count > 0)
-                patchedJson = RewriteXhtmlUrls(patchedJson, sourceBaseUrl, xhtmlUrlMap, xhtmlContentIdMap);
+            if (xhtmlUrlMap.Count > 0 || xhtmlContentIdMap.Count > 0 || xhtmlBlockIdMap.Count > 0)
+                patchedJson = XhtmlProcessor.RewriteXhtmlUrls(patchedJson, sourceBaseUrl, xhtmlUrlMap, xhtmlContentIdMap, xhtmlBlockIdMap);
             var result = await WriteToTargetAsync(targetGuid, patchedJson, target, targetToken, deferredPatches, sourceBaseUrl, sourceToken);
             onItemComplete?.Invoke();
             return result;
@@ -1157,7 +1212,7 @@ public class ContentTransferService : IContentTransferService
         "publishedVersion", "statusReasons", "editUrl"
     ];
 
-    private static string StripReadOnlyProperties(string json, bool preserveParentLink = false)
+    internal static string StripReadOnlyProperties(string json, bool preserveParentLink = false)
     {
         var node = JsonNode.Parse(json)?.AsObject();
         if (node == null) return json;
@@ -1174,68 +1229,8 @@ public class ContentTransferService : IContentTransferService
 
     private static readonly string[] ContentRefEnvFields = ["id", "workId", "url", "providerName", "expanded"];
 
-    // ── Generic JSON tree visitors ────────────────────────────────────────────
-    // One small set of walkers replaces the half-dozen near-identical hand-rolled
-    // "if object recurse / if array recurse" methods that used to be copy-pasted here.
-
-    // Invokes onObject for every JsonObject in a mutable tree (depth-first, parent first).
-    private static void WalkJsonObjects(JsonNode node, Action<JsonObject> onObject)
-    {
-        if (node is JsonObject obj)
-        {
-            onObject(obj);
-            foreach (var child in obj.Select(kvp => kvp.Value).ToList())
-                if (child != null) WalkJsonObjects(child, onObject);
-        }
-        else if (node is JsonArray arr)
-        {
-            foreach (var item in arr)
-                if (item != null) WalkJsonObjects(item, onObject);
-        }
-    }
-
-    // Invokes onObject for every object-kind element in a read-only tree (depth-first, parent first).
-    private static void WalkJsonElements(JsonElement element, Action<JsonElement> onObject)
-    {
-        if (element.ValueKind == JsonValueKind.Object)
-        {
-            onObject(element);
-            foreach (var prop in element.EnumerateObject())
-                WalkJsonElements(prop.Value, onObject);
-        }
-        else if (element.ValueKind == JsonValueKind.Array)
-        {
-            foreach (var item in element.EnumerateArray())
-                WalkJsonElements(item, onObject);
-        }
-    }
-
-    // Applies transform to every string value in the tree, whether held as an object
-    // property or an array element.
-    private static void MutateJsonStrings(JsonNode node, Func<string, string> transform)
-    {
-        if (node is JsonObject obj)
-        {
-            foreach (var key in obj.Select(kvp => kvp.Key).ToList())
-            {
-                var child = obj[key];
-                if (child is JsonValue val && val.TryGetValue(out string str))
-                    obj[key] = transform(str);
-                else if (child != null)
-                    MutateJsonStrings(child, transform);
-            }
-        }
-        else if (node is JsonArray arr)
-        {
-            for (int i = 0; i < arr.Count; i++)
-            {
-                if (arr[i] is JsonValue val && val.TryGetValue(out string str))
-                    arr[i] = transform(str);
-                else if (arr[i] != null)
-                    MutateJsonStrings(arr[i], transform);
-            }
-        }
-    }
+    // ── JSON tree visitors (WalkJsonObjects / WalkJsonElements / MutateJsonStrings) live in
+    //    JsonVisitors.cs, imported via `using static` so the calls below read unqualified.
 
     private static void StripContentReferenceIds(JsonNode node) =>
         WalkJsonObjects(node, obj =>
@@ -1247,7 +1242,7 @@ public class ContentTransferService : IContentTransferService
                     obj.Remove(field);
         });
 
-    private static string InjectStatus(string json, string status)
+    internal static string InjectStatus(string json, string status)
     {
         var node = JsonNode.Parse(json)?.AsObject();
         if (node == null) return json;
@@ -1255,7 +1250,7 @@ public class ContentTransferService : IContentTransferService
         return node.ToJsonString();
     }
 
-    private static string InjectParentLink(string json, Guid parentGuid)
+    internal static string InjectParentLink(string json, Guid parentGuid)
     {
         var node = JsonNode.Parse(json)?.AsObject();
         if (node == null) return json;
@@ -1266,7 +1261,7 @@ public class ContentTransferService : IContentTransferService
     // Walks the JSON tree and, for every content-reference object whose guidValue is in
     // targetIdMap, injects the corresponding target integer id + workId so the Content
     // Management API can bind the property (guidValue alone is not enough for media refs).
-    private static string InjectTargetContentIds(string json, Dictionary<Guid, int?> targetIdMap)
+    internal static string InjectTargetContentIds(string json, Dictionary<Guid, int?> targetIdMap)
     {
         var node = JsonNode.Parse(json);
         if (node == null) return json;
@@ -1475,38 +1470,14 @@ public class ContentTransferService : IContentTransferService
     private Task<Guid?> FindByUrlOnSourceAsync(string relativeUrl, string sourceBaseUrl, string sourceToken) =>
         FindByUrlAsync(sourceBaseUrl, sourceToken, relativeUrl, "URL lookup on source");
 
-    // Extracts all image src attribute values from PropertyXhtmlString fields in a JSON document.
-    private static List<string> ExtractXhtmlImageUrls(string json)
-    {
-        var urls = new List<string>();
-        try
-        {
-            using var doc = JsonDocument.Parse(json);
-            CollectXhtmlUrls(doc.RootElement, urls);
-        }
-        catch { }
-        return urls;
-    }
-
-    private static void CollectXhtmlUrls(JsonElement element, List<string> urls) =>
-        WalkJsonElements(element, obj =>
-        {
-            if (obj.TryGetProperty("propertyDataType", out var pdt) &&
-                pdt.GetString() == "PropertyXhtmlString" &&
-                obj.TryGetProperty("value", out var val) &&
-                val.ValueKind == JsonValueKind.String)
-            {
-                var html = val.GetString() ?? "";
-                foreach (Match m in Regex.Matches(html, @"src=""([^""]+)"""))
-                    urls.Add(m.Groups[1].Value);
-            }
-        });
+    // Inline-asset URL + content-fragment extraction (ExtractXhtmlImageUrls /
+    // ExtractXhtmlContentFragments / ParseContentFragments) lives in XhtmlProcessor.cs.
 
     // Replaces the source environment origin (scheme+host) with the target origin in every
     // string value throughout the JSON document. Handles plain URL properties (PropertyUrl,
     // PropertyLongString containing links) as well as any other field that may store an
     // absolute URL pointing back at the source environment.
-    private static string ReplaceSourceDomain(string json, string sourceBaseUrl, string targetBaseUrl)
+    internal static string ReplaceSourceDomain(string json, string sourceBaseUrl, string targetBaseUrl)
     {
         try
         {
@@ -1642,82 +1613,10 @@ public class ContentTransferService : IContentTransferService
         return sourceUrl.Replace(sourceOrigin, targetOrigin, StringComparison.OrdinalIgnoreCase);
     }
 
-    // Strips the source environment origin (scheme+host) from all image src URLs inside
-    // PropertyXhtmlString values so that relative paths (/contentassets/... /globalassets/...)
-    // resolve correctly on any target environment.
-    // xhtmlUrlMap (optional): source relative path → target relative path. Applied after stripping
-    // the origin so that bucket-GUID mismatches between environments are fixed up.
-    private static string RewriteXhtmlUrls(string json, string sourceBaseUrl,
-        Dictionary<string, string> xhtmlUrlMap = null, Dictionary<int, int> contentIdMap = null)
-    {
-        var node = JsonNode.Parse(json)?.AsObject();
-        if (node == null) return json;
-        try
-        {
-            var origin = new Uri(sourceBaseUrl).GetLeftPart(UriPartial.Authority);
-            RewriteXhtmlNodes(node, origin, xhtmlUrlMap, contentIdMap);
-        }
-        catch { }
-        return node.ToJsonString();
-    }
+    // XHTML URL/id rewriting (RewriteXhtmlUrls), ToRelativePath and NormalizeInlineImagePath
+    // live in XhtmlProcessor.cs.
 
-    private static void RewriteXhtmlNodes(JsonNode node, string origin,
-        Dictionary<string, string> xhtmlUrlMap = null, Dictionary<int, int> contentIdMap = null) =>
-        WalkJsonObjects(node, obj =>
-        {
-            if (obj["propertyDataType"]?.GetValue<string>() != "PropertyXhtmlString" ||
-                obj["value"] is not JsonValue val)
-                return;
-            try
-            {
-                var html = val.GetValue<string>() ?? "";
-                if (html.Contains(origin, StringComparison.OrdinalIgnoreCase))
-                    html = html.Replace(origin, "", StringComparison.OrdinalIgnoreCase);
-                if (xhtmlUrlMap != null)
-                    foreach (var (src, tgt) in xhtmlUrlMap)
-                        if (!string.IsNullOrEmpty(src) && !string.IsNullOrEmpty(tgt))
-                            html = html.Replace(src, tgt, StringComparison.OrdinalIgnoreCase);
-                // Remap the environment-specific ",,{id}" content id embedded in editor media URLs.
-                // Bounded by a non-digit lookahead so ",,105" never matches inside ",,1050".
-                if (contentIdMap != null)
-                    foreach (var (sourceId, targetId) in contentIdMap)
-                        html = Regex.Replace(html, $",,{sourceId}(?=\\D|$)", $",,{targetId}");
-                obj["value"] = html;
-            }
-            catch { }
-        });
-
-    // Converts an absolute URL to its path component, or returns the input unchanged if
-    // it is already relative.
-    private static string ToRelativePath(string url)
-    {
-        if (string.IsNullOrEmpty(url)) return null;
-        if (Uri.TryCreate(url, UriKind.Absolute, out var uri))
-            return uri.PathAndQuery;
-        return url.StartsWith('/') ? url : null;
-    }
-
-    private const string EditModeContentPrefix = "/EPiServer/CMS/Content";
-
-    // Turns an XHTML <img src> into a path we can resolve back to a content GUID. Editor markup
-    // commonly stores internal edit-mode URLs such as
-    //   /EPiServer/CMS/Content/globalassets/en/foo/bar.jpg,,108%3Fepieditmode=false
-    // so we: URL-decode (the query is often %3F-encoded), drop the query/fragment, strip the
-    // ",,<version>" suffix, and rewrite the edit-mode prefix to its friendly form (/globalassets/…).
-    private static string NormalizeInlineImagePath(string relPath)
-    {
-        if (string.IsNullOrEmpty(relPath)) return relPath;
-        var p = Uri.UnescapeDataString(relPath);
-        var q = p.IndexOfAny(['?', '#']);
-        if (q >= 0) p = p[..q];
-        var v = p.IndexOf(",,", StringComparison.Ordinal);
-        if (v >= 0) p = p[..v];
-        if (p.StartsWith(EditModeContentPrefix, StringComparison.OrdinalIgnoreCase))
-            p = p[EditModeContentPrefix.Length..];
-        return p;
-    }
-
-    private static List<Guid> ExtractContentReferenceGuids(string json)
+    internal static List<Guid> ExtractContentReferenceGuids(string json)
     {
         var guids = new List<Guid>();
         try
@@ -1842,7 +1741,7 @@ public class ContentTransferService : IContentTransferService
         return null;
     }
 
-    private static string GetAssetBinaryUrl(string json)
+    internal static string GetAssetBinaryUrl(string json)
     {
         try
         {
