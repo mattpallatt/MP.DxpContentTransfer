@@ -93,7 +93,8 @@ public class DxpTransferApiController : ControllerBase
                     sourceEnvironmentName,
                     request.TransferStatus ?? "Published",
                     request.Plan,
-                    onItemComplete: () => Interlocked.Increment(ref job.Completed));
+                    onItemComplete: () => Interlocked.Increment(ref job.Completed),
+                    selectedLanguages: request.SelectedLanguages is { Count: > 0 } ? request.SelectedLanguages : null);
                 job.Result = result;
             }
             catch (Exception ex)

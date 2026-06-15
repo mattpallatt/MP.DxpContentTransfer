@@ -142,4 +142,25 @@ public class JsonSurgeryTests
         var json = """{ "contentType": ["Media"], "language": { } }""";
         Assert.Null(ContentTransferService.GetAssetBinaryUrl(json));
     }
+
+    // ── IsLocalContent ─────────────────────────────────────────────────────────
+    [Fact]
+    public void IsLocalContent_true_from_own_url()
+        => Assert.True(ContentTransferService.IsLocalContent("""{ "url": "https://x/contentassets/abc/" }"""));
+
+    [Fact]
+    public void IsLocalContent_true_from_parentLink_url_when_own_url_is_null()
+    {
+        // The CMA returns "url": null for content inside an asset folder; the parentLink still carries
+        // the /contentassets/ path. Missing this fallback orphaned local blocks.
+        var json = """{ "url": null, "parentLink": { "guidValue": "a03a69be-f9dc-426e-bc46-2dcc24cc0ec0", "url": "https://x/contentassets/a03a69bef9dc426ebc462dcc24cc0ec0/" } }""";
+        Assert.True(ContentTransferService.IsLocalContent(json));
+    }
+
+    [Fact]
+    public void IsLocalContent_false_for_global_content()
+    {
+        Assert.False(ContentTransferService.IsLocalContent("""{ "url": "https://x/globalassets/news/a.jpg", "parentLink": { "url": "https://x/globalassets/news/" } }"""));
+        Assert.False(ContentTransferService.IsLocalContent("""{ "url": null, "parentLink": { "url": null } }"""));
+    }
 }

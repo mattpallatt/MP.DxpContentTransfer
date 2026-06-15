@@ -20,13 +20,14 @@
             background: #fff;
         }
         h3 { font-size: 14px; font-weight: 600; margin: 0 0 6px; color: #1a1a1a; }
-        .page-name { font-size: 13px; color: #555; margin-bottom: 12px; word-break: break-word; }
-        .env-badge {
-            display: inline-block; font-size: 12px; font-weight: 500;
+        .page-name { font-size: 14px; color: #555; margin-bottom: 12px; word-break: break-word; }
+        .root-name {
+            display: inline-block; font-size: 14px; font-weight: 500;
             background: #e8f0fb; color: #2973c3; padding: 2px 8px;
-            border-radius: 10px; margin-bottom: 12px;
+            border-radius: 10px; margin-left: 4px; vertical-align: middle;
         }
-        label { display: block; font-size: 13px; font-weight: 500; margin-bottom: 4px; color: #333; }
+        .section-title { font-size: 14px; font-weight: 600; color: #1a1a1a; margin: 14px 0 10px; }
+        label { display: block; font-size: 14px; font-weight: 500; margin-bottom: 4px; color: #333; }
         select {
             width: 100%; padding: 6px 8px; border: 1px solid #bbb;
             border-radius: 3px; font-size: 14px; margin-bottom: 12px;
@@ -34,10 +35,10 @@
         }
         select:focus { outline: none; border-color: #2973c3; box-shadow: 0 0 0 2px rgba(41,115,195,0.2); }
         .checkbox-row { display: flex; align-items: center; gap: 7px; margin-bottom: 9px; }
-        .checkbox-row label { margin: 0; font-weight: 400; font-size: 13px; }
+        .checkbox-row label { margin: 0; font-weight: 400; font-size: 14px; }
         .radio-group { margin-bottom: 12px; }
         .radio-group .radio-row { display: flex; align-items: center; gap: 7px; margin-bottom: 6px; }
-        .radio-group .radio-row label { margin: 0; font-weight: 400; font-size: 13px; }
+        .radio-group .radio-row label { margin: 0; font-weight: 400; font-size: 14px; }
         .divider { border: none; border-top: 1px solid #e5e5e5; margin: 10px 0; }
         button {
             width: 100%; padding: 8px 12px; background: #2973c3; color: #fff;
@@ -52,17 +53,17 @@
         .btn-cancel:hover { background: #444 !important; }
         .result {
             margin-top: 12px; padding: 9px 11px; border-radius: 3px;
-            font-size: 13px; display: none; white-space: pre-wrap; line-height: 1.5;
+            font-size: 14px; display: none; white-space: pre-wrap; line-height: 1.5;
         }
         .result.success { background: #e8f5e9; color: #1b5e20; border: 1px solid #a5d6a7; }
         .result.partial { background: #fff8e1; color: #7a5500; border: 1px solid #ffe082; }
         .result.error   { background: #fdecea; color: #b71c1c; border: 1px solid #ef9a9a; }
         .warning {
             color: #7a5500; background: #fff8e1; border: 1px solid #ffe082;
-            padding: 9px 11px; border-radius: 3px; font-size: 13px; line-height: 1.5;
+            padding: 9px 11px; border-radius: 3px; font-size: 14px; line-height: 1.5;
         }
-        .status-msg { color: #666; font-size: 13px; padding: 16px 0; text-align: center; }
-        .plan-summary { font-size: 13px; margin-bottom: 8px; line-height: 2; }
+        .status-msg { color: #666; font-size: 14px; padding: 16px 0; text-align: center; }
+        .plan-summary { font-size: 14px; margin-bottom: 8px; line-height: 2; }
         .plan-scroll { max-height: 380px; overflow-y: auto; border: 1px solid #e8e8e8; border-radius: 3px; margin-bottom: 6px; }
         .plan-table { width: 100%; border-collapse: collapse; font-size: 12px; }
         .plan-table th { text-align: left; font-weight: 600; padding: 4px 5px; border-bottom: 1px solid #ddd; background: #f5f5f5; }
@@ -112,6 +113,40 @@
             font-size: 12px; color: #555; background: #f5f8ff; border: 1px solid #cde;
             border-radius: 3px; padding: 5px 9px; margin-bottom: 8px; display: none;
         }
+        /* One-line field rows: label + control side by side (shared by the language + environment pickers). */
+        .field-row { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+        .field-label { flex: 0 0 130px; margin: 0; font-size: 14px; font-weight: 500; color: #333; white-space: nowrap; }
+        /* Match the native select to the custom language toggle: strip the OS chrome, add the same caret. */
+        .field-row select {
+            flex: 1; width: auto; margin-bottom: 0;
+            appearance: none; -webkit-appearance: none; -moz-appearance: none;
+            padding: 6px 26px 6px 8px; font-weight: 400; color: #1a1a1a; cursor: pointer;
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%23888'/%3E%3C/svg%3E");
+            background-repeat: no-repeat; background-position: right 9px center; background-size: 9px 6px;
+        }
+        .field-row select::-ms-expand { display: none; }
+        .lang-multiselect { position: relative; flex: 1; }
+        .lang-toggle {
+            width: 100%; text-align: left; background: #fff; color: #1a1a1a; border: 1px solid #bbb;
+            border-radius: 3px; padding: 6px 8px; font-size: 14px; font-weight: 400; cursor: pointer;
+            display: flex; justify-content: space-between; align-items: center; gap: 6px;
+        }
+        .lang-toggle:hover { background: #fff; color: #1a1a1a; border-color: #888; }
+        .lang-toggle:focus { outline: none; border-color: #2973c3; box-shadow: 0 0 0 2px rgba(41,115,195,0.2); }
+        .lang-caret { color: #888; font-size: 10px; flex-shrink: 0; }
+        .lang-menu {
+            position: absolute; z-index: 20; top: calc(100% + 2px); left: 0; right: 0;
+            background: #fff; border: 1px solid #bbb; border-radius: 3px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.15); max-height: 200px; overflow-y: auto; padding: 4px 0;
+        }
+        .lang-item {
+            display: flex; align-items: center; gap: 7px; padding: 5px 10px;
+            font-size: 14px; cursor: pointer; white-space: nowrap;
+        }
+        .lang-item:hover { background: #f0f6fc; }
+        .lang-item input { margin: 0; cursor: pointer; }
+        .lang-item .lang-name { text-transform: capitalize; }
+        .lang-item .lang-code { color: #999; }
     </style>
 </head>
 <body>
@@ -152,31 +187,49 @@ else
 {
     <!-- ── Form ──────────────────────────────────────────── -->
     <div id="dxp-form">
-        <h3>Transfer Content</h3>
-        <div class="page-name">@Model.ContentName</div>
+        <h3>Transferring Root Page <span class="root-name">@Model.ContentName</span></h3>
 
-        @if (Model.CurrentEnvironmentName != "Unknown")
-        {
-            <span class="env-badge">Current: @Model.CurrentEnvironmentName</span>
-        }
+        <div class="section-title">Transfer Options</div>
 
-        <label for="dxp-target">Transfer to</label>
-        <select id="dxp-target">
+        <div class="field-row">
+            <label class="field-label" for="dxp-target">Environment</label>
+            <select id="dxp-target">
             @foreach (var env in Model.AvailableTargets)
             {
                 <option value="@env.Name">@env.Name</option>
             }
-        </select>
+            </select>
+        </div>
 
-        <div class="radio-group">
-            <div class="radio-row">
-                <input type="radio" name="dxp-status" id="dxp-status-draft" value="CheckedOut" />
-                <label for="dxp-status-draft">Transfer as draft</label>
+        @if (Model.AvailableLanguages != null && Model.AvailableLanguages.Count >= 2)
+        {
+            <div id="dxp-lang-row" class="field-row">
+                <label class="field-label">Languages</label>
+                <div class="lang-multiselect">
+                    <button type="button" class="lang-toggle" id="dxp-lang-toggle" onclick="dxpTransfer.toggleLangMenu()">
+                        <span id="dxp-lang-text">All Languages</span>
+                        <span class="lang-caret">&#9662;</span>
+                    </button>
+                    <div class="lang-menu" id="dxp-lang-menu" style="display:none">
+                        @foreach (var lang in Model.AvailableLanguages)
+                        {
+                            <label class="lang-item">
+                                <input type="checkbox" value="@lang.Code" onchange="dxpTransfer.updateLangText()" />
+                                <span class="lang-name">@lang.DisplayName</span>
+                                <span class="lang-code">[@lang.Code]</span>
+                            </label>
+                        }
+                    </div>
+                </div>
             </div>
-            <div class="radio-row">
-                <input type="radio" name="dxp-status" id="dxp-status-published" value="Published" checked />
-                <label for="dxp-status-published">Transfer as published</label>
-            </div>
+        }
+
+        <div class="field-row">
+            <label class="field-label" for="dxp-state">State</label>
+            <select id="dxp-state">
+                <option value="Published" selected>Published</option>
+                <option value="CheckedOut">Draft</option>
+            </select>
         </div>
 
         <hr class="divider" />
@@ -191,7 +244,7 @@ else
             <label for="dxp-overwrite">Overwrite Matched Pages</label>
         </div>
 
-        <button onclick="dxpTransfer.check()">Check Transfer Plan</button>
+        <button id="dxp-check-btn" onclick="dxpTransfer.check()">Check Transfer Plan</button>
     </div>
 
     <!-- ── Checking ──────────────────────────────────────── -->
@@ -217,6 +270,7 @@ else
 <script>
 var dxpTransfer = (function () {
     var contentId = '@Html.Raw(Model.ContentId)';
+    var currentEnv = @Html.Raw(System.Text.Json.JsonSerializer.Serialize(Model.CurrentEnvironmentName));
     var plan = null;
     var pollTimer = null;
     var planRows = [];      // flat ordered list for polling: dep rows come before their page row
@@ -235,11 +289,26 @@ var dxpTransfer = (function () {
         }
     });
 
-    document.getElementById('dxp-target')?.addEventListener('change', resetResult);
+    document.getElementById('dxp-target')?.addEventListener('change', function () {
+        resetResult();
+        updateCheckBtn();
+    });
 
     function getStatus() {
-        var el = document.querySelector('input[name="dxp-status"]:checked');
+        var el = document.getElementById('dxp-state');
         return el ? el.value : 'Published';
+    }
+
+    // Reflect the selected environments in the check button: "Transfer from {current} to {target}".
+    function updateCheckBtn() {
+        var btn = document.getElementById('dxp-check-btn');
+        if (!btn) return;
+        var target = document.getElementById('dxp-target');
+        var targetName = target ? target.value : '';
+        if (!targetName) { btn.textContent = 'Check Transfer Plan'; return; }
+        btn.textContent = (currentEnv && currentEnv !== 'Unknown')
+            ? 'Transfer from ' + currentEnv + ' to ' + targetName
+            : 'Transfer to ' + targetName;
     }
 
     function check() {
@@ -363,8 +432,28 @@ var dxpTransfer = (function () {
             targetEnvironment: document.getElementById('dxp-target').value,
             includeChildren: document.getElementById('dxp-children').checked,
             overwriteMatchingIds: document.getElementById('dxp-overwrite').checked,
-            transferStatus: getStatus()
+            transferStatus: getStatus(),
+            selectedLanguages: getSelectedLanguages()
         };
+    }
+
+    // ── Language picker ─────────────────────────────────────
+    // The picker is server-rendered on the form (only when the content has 2+ languages); no boxes
+    // ticked = "transfer all languages". These helpers no-op gracefully when the picker is absent.
+
+    function getSelectedLanguages() {
+        return Array.prototype.slice
+            .call(document.querySelectorAll('#dxp-lang-menu input:checked'))
+            .map(function (cb) { return cb.value; });
+    }
+
+    function updateLangText() {
+        var text = document.getElementById('dxp-lang-text');
+        if (!text) return;
+        var selected = getSelectedLanguages();
+        text.textContent =
+            selected.length === 0 ? 'All Languages'
+            : selected.length + ' Language' + (selected.length === 1 ? '' : 's') + ' selected';
     }
 
     // ── Row-level progress polling ──────────────────────────
@@ -770,7 +859,21 @@ var dxpTransfer = (function () {
         return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
     }
 
-    return { check: check, confirm: confirm, cancel: cancel, downloadLog: downloadLog };
+    function toggleLangMenu() {
+        var menu = document.getElementById('dxp-lang-menu');
+        menu.style.display = menu.style.display === 'none' ? 'block' : 'none';
+    }
+
+    // Close the language menu when clicking anywhere outside it.
+    document.addEventListener('click', function (e) {
+        var ms = document.querySelector('.lang-multiselect');
+        var menu = document.getElementById('dxp-lang-menu');
+        if (menu && ms && !ms.contains(e.target)) menu.style.display = 'none';
+    });
+
+    updateCheckBtn();
+
+    return { check: check, confirm: confirm, cancel: cancel, downloadLog: downloadLog, toggleLangMenu: toggleLangMenu, updateLangText: updateLangText };
 })();
 </script>
 </body>

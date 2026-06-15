@@ -8,6 +8,7 @@ using DxpContentTransfer.Models;
 using EPiServer;
 using EPiServer.Core;
 using EPiServer.Core.Html.StringParsing;
+using EPiServer.DataAbstraction;
 using EPiServer.SpecializedProperties;
 using EPiServer.Web;
 using EPiServer.Web.Routing;
@@ -23,6 +24,7 @@ public class ContentTransferService : IContentTransferService
     private readonly CmaClient _cma;
     private readonly IContentLoader _contentLoader;
     private readonly IUrlResolver _urlResolver;
+    private readonly IContentTypeRepository _contentTypeRepository;
     private readonly ILogger<ContentTransferService> _logger;
 
     // A single CMA PUT can require several retries as we strip unknown/required properties one at
@@ -31,7 +33,7 @@ public class ContentTransferService : IContentTransferService
 
     // Bumped whenever behaviour changes, and logged at the start of every pre-check/transfer so the
     // running build can be confirmed from the logs. Keep in sync with the package version.
-    private const string BuildMarker = "0.5.0 (XhtmlProcessor/JsonVisitors split; HtmlAgilityPack on read paths)";
+    private const string BuildMarker = "0.6.0 (multilingual transfer + language picker)";
 
     public ContentTransferService(
         IDxpSettingsService settingsService,
@@ -39,6 +41,7 @@ public class ContentTransferService : IContentTransferService
         CmaClient cma,
         IContentLoader contentLoader,
         IUrlResolver urlResolver,
+        IContentTypeRepository contentTypeRepository,
         ILogger<ContentTransferService> logger)
     {
         _settingsService = settingsService;
@@ -46,6 +49,7 @@ public class ContentTransferService : IContentTransferService
         _cma = cma;
         _contentLoader = contentLoader;
         _urlResolver = urlResolver;
+        _contentTypeRepository = contentTypeRepository;
         _logger = logger;
     }
 
@@ -120,12 +124,28 @@ public class ContentTransferService : IContentTransferService
             })
             .ToList();
 
+        // The languages the selected content exists in — read here (before the first await) since
+        // ILocalizable.ExistingLanguages is DB-backed. Union across all items, friendly name + locale.
+        var availableLanguages = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var ctx in itemContexts)
+            if (ctx.content is ILocalizable localizable && localizable.ExistingLanguages != null)
+                foreach (var culture in localizable.ExistingLanguages)
+                    if (culture != null && !string.IsNullOrEmpty(culture.Name))
+                        availableLanguages[culture.Name] = culture.EnglishName;
+
         // All IContentLoader work done — now safe to await.
         string targetToken;
         try { targetToken = await _tokenService.GetTokenAsync(target); }
         catch (Exception ex) { return new PreCheckResult { Success = false, ErrorMessage = $"Failed to authenticate with target environment: {ex.Message}" }; }
 
-        var result = new PreCheckResult { Success = true };
+        var result = new PreCheckResult
+        {
+            Success = true,
+            AvailableLanguages = availableLanguages
+                .OrderBy(kv => kv.Value, StringComparer.OrdinalIgnoreCase)
+                .Select(kv => new LanguageOption { Code = kv.Key, DisplayName = kv.Value })
+                .ToList()
+        };
 
         foreach (var (itemRef, content, directParentSourceGuid, directParentName, ancestorsWithUrls, deps) in itemContexts)
         {
@@ -549,7 +569,8 @@ public class ContentTransferService : IContentTransferService
         string sourceEnvironmentName,
         string transferStatus = "Published",
         List<PreCheckItemResult> plan = null,
-        Action onItemComplete = null)
+        Action onItemComplete = null,
+        IReadOnlyCollection<string> selectedLanguages = null)
     {
         _logger.LogInformation("DXP Content Transfer starting — build {Build}", BuildMarker);
         var settings = _settingsService.Get();
@@ -596,6 +617,44 @@ public class ContentTransferService : IContentTransferService
             })
             .ToList();
 
+        // Pre-load the culture-specific (translatable) property names per content type, on the HTTP
+        // thread — PropertyDefinition access is DB-backed, same affinity rule as the content pre-load
+        // above. The background transfer uses this to build language-branch payloads (which must omit
+        // culture-invariant properties) without touching IContentLoader/IContentTypeRepository.
+        var cultureSpecificByType = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            foreach (var ct in _contentTypeRepository.List())
+            {
+                var specific = ct.PropertyDefinitions
+                    .Where(pd => pd.LanguageSpecific)
+                    .Select(pd => pd.Name)
+                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
+                if (specific.Count > 0) cultureSpecificByType[ct.Name] = specific;
+            }
+        }
+        catch (Exception ex) { _logger.LogWarning("Could not pre-load culture-specific property map: {Error}", ex.Message); }
+
+        // An image content-type name for the asset-folder probe (uploading a tiny image makes Optimizely
+        // create+attach a content's "For This Page" folder, which page-local blocks must be parented by).
+        // Discovered on the HTTP thread; the target must have the same content types deployed.
+        string imageTypeName = null;
+        try
+        {
+            var modelTypes = _contentTypeRepository.List().Where(ct => ct.ModelType != null).ToList();
+            imageTypeName = modelTypes.FirstOrDefault(ct => typeof(IContentImage).IsAssignableFrom(ct.ModelType))?.Name
+                         ?? modelTypes.FirstOrDefault(ct => typeof(ImageData).IsAssignableFrom(ct.ModelType))?.Name;
+            _logger.LogDebug("Asset-folder probe image type: {Type}", imageTypeName ?? "(none found)");
+        }
+        catch (Exception ex) { _logger.LogDebug("Could not resolve an image content type for asset-folder probing: {Error}", ex.Message); }
+
+        var languagePlan = new LanguagePlan
+        {
+            Selected = selectedLanguages == null ? null : new HashSet<string>(selectedLanguages, StringComparer.OrdinalIgnoreCase),
+            CultureSpecificByType = cultureSpecificByType,
+            ImageTypeName = imageTypeName
+        };
+
         // All IContentLoader work done — now safe to await.
         string targetToken;
         try { targetToken = await _tokenService.GetTokenAsync(target); }
@@ -619,7 +678,7 @@ public class ContentTransferService : IContentTransferService
                 ctx.itemRef, ctx.content, ctx.contentName, ctx.sourceGuid,
                 ctx.ancestorsWithUrls,
                 source.BaseUrl, sourceToken, target, targetToken,
-                planItem, transferStatus, onItemComplete, deferredPatches);
+                planItem, transferStatus, onItemComplete, deferredPatches, languagePlan);
             result.Items.Add(itemResult);
             if (!itemResult.Success)
                 result.Success = false;
@@ -744,7 +803,8 @@ public class ContentTransferService : IContentTransferService
         PreCheckItemResult planItem,
         string transferStatus = "Published",
         Action onItemComplete = null,
-        List<(Guid guid, string property, string json)> deferredPatches = null)
+        List<(Guid guid, string property, string json)> deferredPatches = null,
+        LanguagePlan languagePlan = null)
     {
         // content, contentName, sourceGuid, ancestorsWithUrls are all pre-loaded by caller.
         if (content == null)
@@ -788,7 +848,7 @@ public class ContentTransferService : IContentTransferService
                 sourceGuid, sourceJson, sourceBaseUrl, sourceToken,
                 target, targetToken, targetGuid, targetParentGuid,
                 (transferStatus == "CheckedOut") ? "CheckedOut" : "Published",
-                visited, onItemComplete, deferredPatches, failedDependencyGuids);
+                visited, onItemComplete, deferredPatches, failedDependencyGuids, languagePlan);
 
             return new TransferItemResult
             {
@@ -831,7 +891,8 @@ public class ContentTransferService : IContentTransferService
         HashSet<Guid> visited,
         Action onItemComplete,
         List<(Guid guid, string property, string json)> deferredPatches = null,
-        List<string> failedDependencyGuids = null)
+        List<string> failedDependencyGuids = null,
+        LanguagePlan languagePlan = null)
     {
         // ── Step 1: Blocks and global media ──────────────────────────────────
         // Process blocks depth-first (they must exist before the parent is written).
@@ -841,126 +902,17 @@ public class ContentTransferService : IContentTransferService
         // the asset bucket for this item.
         var idMap = new Dictionary<Guid, int?>();
         var deferredLocalMedia = new List<(Guid guid, string json)>();
+        var deferredLocalBlocks = new List<(Guid guid, string json)>();
 
         // Inline content blocks (epi-contentfragment divs) reference a block by guid *inside* the
-        // XHTML string, so ExtractContentReferenceGuids — which walks guidValue JSON nodes — never
-        // sees them. Surface their guids here so they're transferred (created if new, re-PUT if they
-        // exist) exactly like a ContentArea block. data-contentlink (the source integer id) is
-        // remapped to the target id in step 4.
+        // XHTML string; their guids are surfaced for the step-4 data-contentlink remap (and, inside
+        // ProcessReferencedDependenciesAsync, folded into the transfer set).
         var inlineFragments = XhtmlProcessor.ExtractXhtmlContentFragments(sourceJson);
-        var refGuids = ExtractContentReferenceGuids(sourceJson);
-        foreach (var frag in inlineFragments)
-            if (frag.Guid != Guid.Empty && !refGuids.Contains(frag.Guid))
-                refGuids.Add(frag.Guid);
 
-        foreach (var refGuid in refGuids)
-        {
-            if (!visited.Add(refGuid))
-            {
-                var tid = await GetTargetContentIdAsync(refGuid, target, targetToken);
-                if (tid.HasValue) idMap[refGuid] = tid;
-                continue;
-            }
-
-            string refJson;
-            try { refJson = await ReadFromSourceAsync(refGuid, sourceBaseUrl, sourceToken); }
-            catch { visited.Remove(refGuid); continue; }
-
-            bool isMedia, isBlock;
-            try
-            {
-                using var d = JsonDocument.Parse(refJson);
-                isMedia = IsMediaContent(d.RootElement);
-                isBlock = !isMedia && IsBlockContent(d.RootElement);
-            }
-            catch { continue; }
-
-            if (!isMedia && !isBlock)
-            {
-                var tid = await GetTargetContentIdAsync(refGuid, target, targetToken);
-                if (tid.HasValue) idMap[refGuid] = tid;
-                continue;
-            }
-
-            if (isMedia)
-            {
-                if (IsLocalContent(refJson))
-                {
-                    // Asset bucket doesn't exist yet — defer until after step 2
-                    deferredLocalMedia.Add((refGuid, refJson));
-                }
-                else
-                {
-                    // Global media — ensure its parent folder exists on target before uploading.
-                    // Globalassets folder GUIDs are usually identical across DXP environments, but
-                    // sub-folders may be missing if the folder tree was never fully synced.
-                    var mediaParentGuid = ExtractParentGuid(refJson) ?? targetGuid;
-                    if (mediaParentGuid != targetGuid && !await ExistsOnTargetAsync(mediaParentGuid, target, targetToken))
-                    {
-                        // Try to resolve the canonical path and recreate the folder hierarchy
-                        var canonicalUrl = await GetSourceContentUrlAsync(refGuid, sourceBaseUrl, sourceToken);
-                        if (!string.IsNullOrEmpty(canonicalUrl) && canonicalUrl.StartsWith("/globalassets/", StringComparison.OrdinalIgnoreCase))
-                        {
-                            var lastSlash = canonicalUrl.LastIndexOf('/');
-                            var folderPath = lastSlash > 0 ? canonicalUrl[..(lastSlash + 1)] : "/globalassets/";
-                            mediaParentGuid = await EnsureGlobalAssetFolderPathAsync(folderPath, sourceBaseUrl, sourceToken, target, targetToken) ?? targetGuid;
-                        }
-                        else
-                        {
-                            await EnsureContentParentAsync(mediaParentGuid, sourceBaseUrl, sourceToken, target, targetToken, new HashSet<Guid> { refGuid });
-                        }
-                    }
-                    var mediaStub = BuildMinimalAssetJson(refJson, mediaParentGuid);
-                    try
-                    {
-                        idMap[refGuid] = (await WriteAssetToTargetAsync(refGuid, refJson, mediaStub, sourceToken, target, targetToken)).id;
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogWarning("Could not upload global media {Guid}: {Error}", refGuid, ex.Message);
-                        failedDependencyGuids?.Add(refGuid.ToString("D"));
-                        if (await ExistsOnTargetAsync(refGuid, target, targetToken))
-                            idMap[refGuid] = await GetTargetContentIdAsync(refGuid, target, targetToken);
-                    }
-                    onItemComplete?.Invoke();
-                }
-                continue;
-            }
-
-            // Block — depth-first; if it already exists on target, just wire the reference
-            var isLocalBlock = IsLocalContent(refJson);
-            Guid blockParentGuid;
-            if (isLocalBlock)
-            {
-                blockParentGuid = targetGuid;
-            }
-            else
-            {
-                blockParentGuid = ExtractParentGuid(refJson) ?? targetGuid;
-                if (blockParentGuid != targetGuid)
-                    await EnsureContentParentAsync(blockParentGuid, sourceBaseUrl, sourceToken, target, targetToken, new HashSet<Guid> { refGuid });
-            }
-
-            // Always re-transfer block content (even if the block already exists on target).
-            // Skipping existing blocks means stale data — links, URLs, and property changes
-            // made on source would never propagate. PUT is idempotent in the CMA.
-            try
-            {
-                idMap[refGuid] = await TransferItemCoreAsync(
-                    refGuid, refJson, sourceBaseUrl, sourceToken,
-                    target, targetToken,
-                    refGuid, blockParentGuid,
-                    effectiveStatus, visited, onItemComplete, deferredPatches, failedDependencyGuids);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning("Could not transfer block {Guid}: {Error}", refGuid, ex.Message);
-                failedDependencyGuids?.Add(refGuid.ToString("D"));
-                if (await ExistsOnTargetAsync(refGuid, target, targetToken))
-                    idMap[refGuid] = await GetTargetContentIdAsync(refGuid, target, targetToken);
-                onItemComplete?.Invoke();
-            }
-        }
+        await ProcessReferencedDependenciesAsync(
+            sourceJson, sourceBaseUrl, sourceToken, target, targetToken,
+            targetGuid, effectiveStatus, visited, idMap, deferredLocalMedia, deferredLocalBlocks,
+            onItemComplete, deferredPatches, failedDependencyGuids, languagePlan);
 
         // ── Step 2: Full PUT ──────────────────────────────────────────────────
         // Full content (not a stub) ensures all required properties are present.
@@ -995,6 +947,7 @@ public class ContentTransferService : IContentTransferService
                 postIdMap[refGuid] = mediaId;
                 if (mediaRelUrl != null)
                     deferredMediaUrls[refGuid] = mediaRelUrl;
+                await CaptureFolderMappingAsync(refGuid, refJson, target, targetToken, languagePlan);
             }
             catch (Exception ex)
             {
@@ -1005,6 +958,14 @@ public class ContentTransferService : IContentTransferService
             }
             onItemComplete?.Invoke();
         }
+
+        // Local media has now mapped the owner's content-asset folder, so the deferred page-local
+        // blocks can be transferred into it. Their ids feed the step-4 re-PUT so the ContentArea binds.
+        if (deferredLocalBlocks.Count > 0)
+            foreach (var (blockGuid, blockId) in await TransferDeferredLocalBlocksAsync(
+                deferredLocalBlocks, sourceBaseUrl, sourceToken, target, targetToken,
+                targetGuid, effectiveStatus, visited, onItemComplete, deferredPatches, failedDependencyGuids, languagePlan))
+                postIdMap[blockGuid] = blockId;
 
         var seenImagePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var srcUrl in XhtmlProcessor.ExtractXhtmlImageUrls(sourceJson))
@@ -1140,20 +1101,392 @@ public class ContentTransferService : IContentTransferService
         }
 
         // ── Step 4: Second PUT if anything was uploaded post-step-2 ──────────
-        // onItemComplete fires here (after all work for this item is truly done).
+        int? masterTargetId;
         if (postIdMap.Count > 0 || xhtmlUrlMap.Count > 0 || xhtmlContentIdMap.Count > 0 || xhtmlBlockIdMap.Count > 0)
         {
             var patchedJson = baseJson;
             if (postIdMap.Count > 0) patchedJson = InjectTargetContentIds(patchedJson, postIdMap);
             if (xhtmlUrlMap.Count > 0 || xhtmlContentIdMap.Count > 0 || xhtmlBlockIdMap.Count > 0)
                 patchedJson = XhtmlProcessor.RewriteXhtmlUrls(patchedJson, sourceBaseUrl, xhtmlUrlMap, xhtmlContentIdMap, xhtmlBlockIdMap);
-            var result = await WriteToTargetAsync(targetGuid, patchedJson, target, targetToken, deferredPatches, sourceBaseUrl, sourceToken);
-            onItemComplete?.Invoke();
-            return result;
+            masterTargetId = await WriteToTargetAsync(targetGuid, patchedJson, target, targetToken, deferredPatches, sourceBaseUrl, sourceToken);
+        }
+        else
+        {
+            masterTargetId = await GetTargetContentIdAsync(targetGuid, target, targetToken);
         }
 
+        // ── Step 5: Other language branches ──────────────────────────────────
+        // The master language is now on target. Create/update every *other* language this item has
+        // (subject to the user's selection) as a culture-specific branch payload. onItemComplete fires
+        // after this, so the item is only marked done once all its languages are written.
+        await WriteLanguageBranchesAsync(
+            sourceGuid, sourceJson, targetGuid, targetParentGuid, effectiveStatus,
+            sourceBaseUrl, sourceToken, target, targetToken,
+            languagePlan, visited, idMap, xhtmlUrlMap, xhtmlContentIdMap, xhtmlBlockIdMap, deferredPatches, failedDependencyGuids);
+
         onItemComplete?.Invoke();
-        return await GetTargetContentIdAsync(targetGuid, target, targetToken);
+        return masterTargetId;
+    }
+
+    // Transfers the blocks and media a document references into idMap (depth-first; blocks recurse so
+    // their own languages/dependencies follow). Drives both the master pass and each language branch —
+    // for a branch this picks up dependencies the master never had (e.g. a block only in a culture-
+    // specific ContentArea). visited dedups against everything transferred so far this item, so shared
+    // dependencies are wired (id looked up) rather than re-done. Inline content-block guids baked into
+    // XHTML are folded in too, since the guidValue walker can't see them.
+    private async Task ProcessReferencedDependenciesAsync(
+        string json,
+        string sourceBaseUrl, string sourceToken,
+        DxpEnvironmentConfig target, string targetToken,
+        Guid targetGuid, string effectiveStatus,
+        HashSet<Guid> visited, Dictionary<Guid, int?> idMap,
+        List<(Guid guid, string json)> deferredLocalMedia,
+        List<(Guid guid, string json)> deferredLocalBlocks,
+        Action onItemComplete,
+        List<(Guid guid, string property, string json)> deferredPatches,
+        List<string> failedDependencyGuids,
+        LanguagePlan languagePlan)
+    {
+        var refGuids = ExtractContentReferenceGuids(json);
+        foreach (var frag in XhtmlProcessor.ExtractXhtmlContentFragments(json))
+            if (frag.Guid != Guid.Empty && !refGuids.Contains(frag.Guid))
+                refGuids.Add(frag.Guid);
+
+        foreach (var refGuid in refGuids)
+        {
+            if (!visited.Add(refGuid))
+            {
+                var tid = await GetTargetContentIdAsync(refGuid, target, targetToken);
+                if (tid.HasValue) idMap[refGuid] = tid;
+                continue;
+            }
+
+            string refJson;
+            try { refJson = await ReadFromSourceAsync(refGuid, sourceBaseUrl, sourceToken); }
+            catch { visited.Remove(refGuid); continue; }
+
+            bool isMedia, isBlock;
+            try
+            {
+                using var d = JsonDocument.Parse(refJson);
+                isMedia = IsMediaContent(d.RootElement);
+                isBlock = !isMedia && IsBlockContent(d.RootElement);
+            }
+            catch { continue; }
+
+            if (!isMedia && !isBlock)
+            {
+                var tid = await GetTargetContentIdAsync(refGuid, target, targetToken);
+                if (tid.HasValue) idMap[refGuid] = tid;
+                continue;
+            }
+
+            if (isMedia)
+            {
+                if (IsLocalContent(refJson))
+                {
+                    // Asset bucket may not exist yet (master pass) — defer; the caller uploads it
+                    // once the bucket is created. For a branch the bucket already exists, so the
+                    // caller flushes immediately.
+                    deferredLocalMedia.Add((refGuid, refJson));
+                }
+                else
+                {
+                    // Global media — ensure its parent folder exists on target before uploading.
+                    // Globalassets folder GUIDs are usually identical across DXP environments, but
+                    // sub-folders may be missing if the folder tree was never fully synced.
+                    var mediaParentGuid = ExtractParentGuid(refJson) ?? targetGuid;
+                    if (mediaParentGuid != targetGuid && !await ExistsOnTargetAsync(mediaParentGuid, target, targetToken))
+                    {
+                        // Try to resolve the canonical path and recreate the folder hierarchy
+                        var canonicalUrl = await GetSourceContentUrlAsync(refGuid, sourceBaseUrl, sourceToken);
+                        if (!string.IsNullOrEmpty(canonicalUrl) && canonicalUrl.StartsWith("/globalassets/", StringComparison.OrdinalIgnoreCase))
+                        {
+                            var lastSlash = canonicalUrl.LastIndexOf('/');
+                            var folderPath = lastSlash > 0 ? canonicalUrl[..(lastSlash + 1)] : "/globalassets/";
+                            mediaParentGuid = await EnsureGlobalAssetFolderPathAsync(folderPath, sourceBaseUrl, sourceToken, target, targetToken) ?? targetGuid;
+                        }
+                        else
+                        {
+                            await EnsureContentParentAsync(mediaParentGuid, sourceBaseUrl, sourceToken, target, targetToken, new HashSet<Guid> { refGuid });
+                        }
+                    }
+                    var mediaStub = BuildMinimalAssetJson(refJson, mediaParentGuid);
+                    try
+                    {
+                        idMap[refGuid] = (await WriteAssetToTargetAsync(refGuid, refJson, mediaStub, sourceToken, target, targetToken)).id;
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning("Could not upload global media {Guid}: {Error}", refGuid, ex.Message);
+                        failedDependencyGuids?.Add(refGuid.ToString("D"));
+                        if (await ExistsOnTargetAsync(refGuid, target, targetToken))
+                            idMap[refGuid] = await GetTargetContentIdAsync(refGuid, target, targetToken);
+                    }
+                    onItemComplete?.Invoke();
+                }
+                continue;
+            }
+
+            // Page-local blocks belong in the owner's "For This Page/Block" content-asset folder, whose
+            // target GUID isn't known until a sibling local asset has been uploaded (the page must exist
+            // first). Defer them; the caller transfers them once local media has populated the folder map.
+            if (IsLocalContent(refJson))
+            {
+                deferredLocalBlocks.Add((refGuid, refJson));
+                continue;
+            }
+
+            // Shared/global block — its parent is real content we can ensure exists, so transfer now,
+            // depth-first. Always re-transfer (even if it already exists on target): skipping means
+            // stale data — links/URLs/property changes on source would never propagate. PUT is idempotent.
+            var blockParentGuid = ExtractParentGuid(refJson) ?? targetGuid;
+            if (blockParentGuid != targetGuid)
+                await EnsureContentParentAsync(blockParentGuid, sourceBaseUrl, sourceToken, target, targetToken, new HashSet<Guid> { refGuid });
+            try
+            {
+                idMap[refGuid] = await TransferItemCoreAsync(
+                    refGuid, refJson, sourceBaseUrl, sourceToken,
+                    target, targetToken,
+                    refGuid, blockParentGuid,
+                    effectiveStatus, visited, onItemComplete, deferredPatches, failedDependencyGuids, languagePlan);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning("Could not transfer block {Guid}: {Error}", refGuid, ex.Message);
+                failedDependencyGuids?.Add(refGuid.ToString("D"));
+                if (await ExistsOnTargetAsync(refGuid, target, targetToken))
+                    idMap[refGuid] = await GetTargetContentIdAsync(refGuid, target, targetToken);
+                onItemComplete?.Invoke();
+            }
+        }
+    }
+
+    // Transfers page-local blocks that were deferred until the owner's content-asset folder became known
+    // (after a sibling local asset mapped it, or via a probe). Each goes into that folder so the editor's
+    // "For This Page" tab shows it. Results are returned for the caller to inject into the owner's
+    // ContentArea references.
+    private async Task<Dictionary<Guid, int?>> TransferDeferredLocalBlocksAsync(
+        List<(Guid guid, string json)> deferredLocalBlocks,
+        string sourceBaseUrl, string sourceToken, DxpEnvironmentConfig target, string targetToken,
+        Guid ownerTargetGuid, string effectiveStatus, HashSet<Guid> visited,
+        Action onItemComplete, List<(Guid guid, string property, string json)> deferredPatches,
+        List<string> failedDependencyGuids, LanguagePlan languagePlan)
+    {
+        var ids = new Dictionary<Guid, int?>();
+        foreach (var (refGuid, refJson) in deferredLocalBlocks)
+        {
+            var sourceFolder = ExtractParentGuid(refJson);
+            Guid blockParentGuid;
+            if (sourceFolder.HasValue && languagePlan != null && languagePlan.FolderMap.TryGetValue(sourceFolder.Value, out var mapped))
+                blockParentGuid = mapped;
+            else
+                blockParentGuid = await ResolveAssetFolderGuidAsync(ownerTargetGuid, target, targetToken, languagePlan) ?? ownerTargetGuid;
+
+            try
+            {
+                ids[refGuid] = await TransferItemCoreAsync(
+                    refGuid, refJson, sourceBaseUrl, sourceToken,
+                    target, targetToken,
+                    refGuid, blockParentGuid,
+                    effectiveStatus, visited, onItemComplete, deferredPatches, failedDependencyGuids, languagePlan);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning("Could not transfer local block {Guid}: {Error}", refGuid, ex.Message);
+                failedDependencyGuids?.Add(refGuid.ToString("D"));
+                if (await ExistsOnTargetAsync(refGuid, target, targetToken))
+                    ids[refGuid] = await GetTargetContentIdAsync(refGuid, target, targetToken);
+            }
+        }
+        return ids;
+    }
+
+    // Records source-folder → target-folder for a just-transferred page-local media item. Optimizely
+    // routes page-local media into the owner's real content-asset folder, so the target item's
+    // parentLink reveals that folder's generated GUID. Page-local blocks (not routed) reuse this map
+    // to land in the same folder as their sibling assets.
+    private async Task CaptureFolderMappingAsync(Guid mediaGuid, string sourceMediaJson, DxpEnvironmentConfig target, string targetToken, LanguagePlan languagePlan)
+    {
+        if (languagePlan == null) return;
+        var sourceFolder = ExtractParentGuid(sourceMediaJson);
+        if (!sourceFolder.HasValue || languagePlan.FolderMap.ContainsKey(sourceFolder.Value)) return;
+        try
+        {
+            var targetFolder = ExtractParentGuid(await ReadFromTargetAsync(mediaGuid, target, targetToken));
+            if (targetFolder.HasValue)
+            {
+                languagePlan.FolderMap[sourceFolder.Value] = targetFolder.Value;
+                _logger.LogDebug("Mapped content-asset folder {Source} → {Target}", sourceFolder.Value, targetFolder.Value);
+            }
+        }
+        catch (Exception ex) { _logger.LogDebug("Could not map content-asset folder for {Guid}: {Error}", mediaGuid, ex.Message); }
+    }
+
+    // A 1×1 transparent PNG, uploaded purely to make Optimizely create a content's asset folder.
+    private static readonly byte[] ProbePng = Convert.FromBase64String(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==");
+
+    // Resolves (creating if necessary) the target GUID of an owner's "For This Page/Block" content-asset
+    // folder, where page-local blocks must live. The CMA doesn't expose this folder and its GUID is
+    // generated on the target, so we discover it the way Optimizely itself does: uploading a tiny image
+    // to the owner makes the CMA call GetOrCreateAssetFolder and route the image into the folder, whose
+    // GUID is then the image's parentLink. We read that, delete the probe image (the folder it created
+    // stays, linked to the owner), and cache per owner so it's probed at most once.
+    private async Task<Guid?> ResolveAssetFolderGuidAsync(Guid ownerGuid, DxpEnvironmentConfig target, string token, LanguagePlan languagePlan)
+    {
+        if (languagePlan == null) return null;
+        if (languagePlan.AssetFolderCache.TryGetValue(ownerGuid, out var cached)) return cached;
+
+        Guid? folder = null;
+        if (string.IsNullOrEmpty(languagePlan.ImageTypeName))
+            _logger.LogWarning("No image content type available to resolve the asset folder for {Owner}; page-local blocks will be parented by the owner", ownerGuid);
+        else
+        {
+            var probeGuid = Guid.NewGuid();
+            try
+            {
+                var probeJson = new JsonObject
+                {
+                    ["name"] = "__dxp-assetfolder-probe.png",
+                    ["contentType"] = new JsonArray(languagePlan.ImageTypeName),
+                    ["parentLink"] = new JsonObject { ["guidValue"] = ownerGuid.ToString() },
+                    ["status"] = "Published"
+                }.ToJsonString();
+
+                var resp = await _cma.PutAssetBytesAsync(target.BaseUrl, token, probeGuid, probeJson, ProbePng, "__dxp-assetfolder-probe.png", "image/png", "asset-folder probe");
+                if (resp.IsSuccess)
+                {
+                    var parent = ExtractParentGuid(resp.Body);
+                    if (parent.HasValue && parent.Value != ownerGuid) folder = parent;
+                    else _logger.LogWarning("Asset-folder probe for {Owner} was not routed to a folder (parent {Parent}); page-local blocks will be parented by the owner", ownerGuid, parent);
+                    await _cma.DeleteManagementAsync(target.BaseUrl, token, probeGuid, "remove asset-folder probe");
+                }
+                else
+                {
+                    _logger.LogWarning("Asset-folder probe for {Owner} failed ({Status}): {Body}", ownerGuid, (int)resp.Status, resp.Body);
+                }
+            }
+            catch (Exception ex) { _logger.LogWarning("Asset-folder probe for {Owner} errored: {Error}", ownerGuid, ex.Message); }
+        }
+
+        languagePlan.AssetFolderCache[ownerGuid] = folder;
+        return folder;
+    }
+
+    // Writes every non-master language branch of an item that the user kept selected. Each branch is a
+    // culture-specific payload (BuildLanguageBranchJson). Before writing, the branch's own referenced
+    // dependencies are transferred (so a block/image only present in a non-master branch is created),
+    // then the payload reuses the accumulated dependency ids and the master pass's inline-asset rewrites.
+    // A failure on one branch is logged and skipped, never failing the master transfer.
+    private async Task WriteLanguageBranchesAsync(
+        Guid sourceGuid, string masterJson, Guid targetGuid, Guid targetParentGuid, string effectiveStatus,
+        string sourceBaseUrl, string sourceToken, DxpEnvironmentConfig target, string targetToken,
+        LanguagePlan languagePlan, HashSet<Guid> visited, Dictionary<Guid, int?> idMap,
+        Dictionary<string, string> xhtmlUrlMap, Dictionary<int, int> xhtmlContentIdMap, Dictionary<int, int> xhtmlBlockIdMap,
+        List<(Guid guid, string property, string json)> deferredPatches, List<string> failedDependencyGuids)
+    {
+        var master = ExtractContentLanguage(masterJson) ?? ExtractMasterLanguage(masterJson);
+        var branches = ExtractExistingLanguages(masterJson)
+            .Where(l => !string.Equals(l, master, StringComparison.OrdinalIgnoreCase))
+            .Where(l => languagePlan?.Includes(l) ?? true)
+            .ToList();
+        if (branches.Count == 0) return;
+
+        var cultureSpecific = languagePlan?.CultureSpecific(ExtractConcreteContentTypeName(masterJson)) ?? new HashSet<string>();
+
+        foreach (var lang in branches)
+        {
+            try
+            {
+                var branchJson = await ReadFromSourceAsync(sourceGuid, sourceBaseUrl, sourceToken, lang);
+
+                // Transfer dependencies unique to this branch (e.g. a block only in a culture-specific
+                // ContentArea) that the master pass didn't see. The asset bucket already exists (master
+                // wrote it), so branch-local media is uploaded immediately rather than deferred.
+                // onItemComplete is not passed — branch-only dependencies aren't counted in the plan.
+                var branchLocalMedia = new List<(Guid guid, string json)>();
+                var branchLocalBlocks = new List<(Guid guid, string json)>();
+                await ProcessReferencedDependenciesAsync(
+                    branchJson, sourceBaseUrl, sourceToken, target, targetToken,
+                    targetGuid, effectiveStatus, visited, idMap, branchLocalMedia, branchLocalBlocks,
+                    onItemComplete: null, deferredPatches, failedDependencyGuids, languagePlan);
+                foreach (var (mediaGuid, mediaJson) in branchLocalMedia)
+                {
+                    try
+                    {
+                        idMap[mediaGuid] = (await WriteAssetToTargetAsync(mediaGuid, mediaJson, BuildMinimalAssetJson(mediaJson, targetGuid), sourceToken, target, targetToken)).id;
+                        await CaptureFolderMappingAsync(mediaGuid, mediaJson, target, targetToken, languagePlan);
+                    }
+                    catch (Exception ex) { _logger.LogWarning("Could not upload branch media {Guid}: {Error}", mediaGuid, ex.Message); failedDependencyGuids?.Add(mediaGuid.ToString("D")); }
+                }
+                // Branch-only local blocks: now that media has mapped the folder, transfer them into it.
+                foreach (var (blockGuid, blockId) in await TransferDeferredLocalBlocksAsync(
+                    branchLocalBlocks, sourceBaseUrl, sourceToken, target, targetToken,
+                    targetGuid, effectiveStatus, visited, null, deferredPatches, failedDependencyGuids, languagePlan))
+                    idMap[blockGuid] = blockId;
+
+                var payload = BuildLanguageBranchJson(branchJson, cultureSpecific, targetParentGuid, effectiveStatus);
+                if (idMap.Count > 0) payload = InjectTargetContentIds(payload, idMap);
+                payload = await RelinkContentLinksAsync(payload, sourceBaseUrl, target, targetToken);
+                payload = ReplaceSourceDomain(payload, sourceBaseUrl, target.BaseUrl);
+                if (xhtmlUrlMap.Count > 0 || xhtmlContentIdMap.Count > 0 || xhtmlBlockIdMap.Count > 0)
+                    payload = XhtmlProcessor.RewriteXhtmlUrls(payload, sourceBaseUrl, xhtmlUrlMap, xhtmlContentIdMap, xhtmlBlockIdMap);
+                await WriteToTargetAsync(targetGuid, payload, target, targetToken, deferredPatches, sourceBaseUrl, sourceToken);
+                _logger.LogInformation("Transferred '{Lang}' branch of {Guid}", lang, sourceGuid);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning("Could not transfer '{Lang}' branch of {Guid}: {Error}", lang, sourceGuid, ex.Message);
+            }
+        }
+    }
+
+    // The concrete (leaf) content type name from a CMA document's "contentType" array, used to look up
+    // its culture-specific property set. The array runs base → derived, so the last entry is concrete.
+    private static string ExtractConcreteContentTypeName(string json)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            if (doc.RootElement.TryGetProperty("contentType", out var ct) && ct.ValueKind == JsonValueKind.Array)
+            {
+                string last = null;
+                foreach (var item in ct.EnumerateArray())
+                    if (item.ValueKind == JsonValueKind.String) last = item.GetString();
+                return last;
+            }
+        }
+        catch { }
+        return null;
+    }
+
+    // Transfer-wide language settings, computed once on the HTTP thread and threaded through the
+    // recursive transfer (instance state would race across concurrent jobs on the scoped service).
+    private sealed class LanguagePlan
+    {
+        // null = transfer every language each item has; otherwise the (case-insensitive) set chosen.
+        public IReadOnlySet<string> Selected { get; init; }
+        public IReadOnlyDictionary<string, HashSet<string>> CultureSpecificByType { get; init; }
+            = new Dictionary<string, HashSet<string>>();
+
+        // A media content-type name (discovered on the HTTP thread) used for the asset-folder probe,
+        // plus a per-transfer cache of owner GUID → its resolved "For This Page/Block" folder GUID.
+        public string ImageTypeName { get; init; }
+        public Dictionary<Guid, Guid?> AssetFolderCache { get; } = new();
+
+        // Source content-asset folder GUID → the target folder it maps to, learned as local media is
+        // transferred (Optimizely routes page-local media into the owner's real folder, revealing its
+        // generated target GUID). Page-local *blocks* — which Optimizely does NOT route — reuse this to
+        // land in the same folder as their sibling assets.
+        public Dictionary<Guid, Guid> FolderMap { get; } = new();
+
+        public bool Includes(string language) =>
+            Selected == null || (language != null && Selected.Contains(language));
+
+        public HashSet<string> CultureSpecific(string typeName) =>
+            typeName != null && CultureSpecificByType.TryGetValue(typeName, out var set)
+                ? set : new HashSet<string>();
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -1197,9 +1530,9 @@ public class ContentTransferService : IContentTransferService
         return ordered;
     }
 
-    private async Task<string> ReadFromSourceAsync(Guid guid, string sourceBaseUrl, string sourceToken)
+    private async Task<string> ReadFromSourceAsync(Guid guid, string sourceBaseUrl, string sourceToken, string language = null)
     {
-        var r = await _cma.GetManagementAsync(sourceBaseUrl, sourceToken, guid, "read source");
+        var r = await _cma.GetManagementAsync(sourceBaseUrl, sourceToken, guid, "read source", language);
         if (!r.IsSuccess)
             throw new HttpRequestException($"HTTP {(int)r.Status}: {r.Body}");
         return r.Body;
@@ -1255,6 +1588,71 @@ public class ContentTransferService : IContentTransferService
         var node = JsonNode.Parse(json)?.AsObject();
         if (node == null) return json;
         node["parentLink"] = new JsonObject { ["guidValue"] = parentGuid.ToString() };
+        return node.ToJsonString();
+    }
+
+    // ── Multilingual ───────────────────────────────────────────────────────────
+    // Reads the language codes a content item exists in from its CMA JSON ("existingLanguages"),
+    // in the order the CMA returns them. Empty if the field is absent.
+    internal static List<string> ExtractExistingLanguages(string json) =>
+        ExtractLanguageNames(json, "existingLanguages");
+
+    // The branch language of a CMA document ("language.name"), or null.
+    internal static string ExtractContentLanguage(string json) =>
+        ExtractLanguageObjectName(json, "language");
+
+    // The master/default language of a content item ("masterLanguage.name"), or null.
+    internal static string ExtractMasterLanguage(string json) =>
+        ExtractLanguageObjectName(json, "masterLanguage");
+
+    private static List<string> ExtractLanguageNames(string json, string arrayProp)
+    {
+        var langs = new List<string>();
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            if (doc.RootElement.TryGetProperty(arrayProp, out var arr) && arr.ValueKind == JsonValueKind.Array)
+                foreach (var item in arr.EnumerateArray())
+                    if (item.ValueKind == JsonValueKind.Object &&
+                        item.TryGetProperty("name", out var n) && n.ValueKind == JsonValueKind.String &&
+                        n.GetString() is { Length: > 0 } code)
+                        langs.Add(code);
+        }
+        catch { }
+        return langs;
+    }
+
+    private static string ExtractLanguageObjectName(string json, string objProp)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            if (doc.RootElement.TryGetProperty(objProp, out var o) && o.ValueKind == JsonValueKind.Object &&
+                o.TryGetProperty("name", out var n) && n.ValueKind == JsonValueKind.String)
+                return n.GetString();
+        }
+        catch { }
+        return null;
+    }
+
+    // Builds the write payload for a NON-master language branch. The Optimizely CMA treats language
+    // variants as separate objects that share the culture-invariant properties, so a branch write
+    // must send ONLY the culture-specific (translatable) property values — including invariant ones
+    // is what triggers a 409 Conflict. We keep the system fields (name, language, contentType, status)
+    // and every property whose name is in cultureSpecificNames, drop the rest, and bind the parent by
+    // guid. Source environment-specific ref ids are stripped (StripReadOnlyProperties).
+    internal static string BuildLanguageBranchJson(string branchJson, ISet<string> cultureSpecificNames, Guid parentGuid, string status)
+    {
+        var node = JsonNode.Parse(StripReadOnlyProperties(branchJson))?.AsObject();
+        if (node == null) return branchJson;
+
+        foreach (var key in node.Select(kvp => kvp.Key).ToList())
+            if (node[key] is JsonObject prop && prop.ContainsKey("propertyDataType") &&
+                !cultureSpecificNames.Contains(key))
+                node.Remove(key);
+
+        node["parentLink"] = new JsonObject { ["guidValue"] = parentGuid.ToString() };
+        if (!string.IsNullOrEmpty(status)) node["status"] = status;
         return node.ToJsonString();
     }
 
@@ -2045,21 +2443,33 @@ public class ContentTransferService : IContentTransferService
         return node.ToJsonString();
     }
 
-    // Returns true if the content is page-local (url contains /contentassets/).
-    // Local content goes under the page's own "For This Page" bucket.
-    // Global content (/globalassets/ or no URL) preserves its source parentLink.
-    private static bool IsLocalContent(string json)
+    // Returns true if the content lives in a page's "For This Page" content-asset folder (its path
+    // contains /contentassets/). Such content must be parented by the *target* page (targetGuid) so
+    // Optimizely files it in that page's own asset folder — NOT by the source folder's guid, which
+    // doesn't exist on the target and would orphan the block in a recreated copy.
+    //
+    // The content's own "url" is the obvious signal, but the CMA GET returns "url": null for anything
+    // inside a content-asset folder — so we also check parentLink.url, which still carries the
+    // /contentassets/{guid}/ path. Missing that fallback misdetects local blocks as global and is what
+    // sent them to an orphan folder. Global content (/globalassets/ or no url at all) preserves its
+    // source parentLink.
+    internal static bool IsLocalContent(string json)
     {
         try
         {
             using var doc = JsonDocument.Parse(json);
-            if (doc.RootElement.TryGetProperty("url", out var urlProp) &&
-                urlProp.ValueKind == JsonValueKind.String)
-                return (urlProp.GetString() ?? "").Contains("/contentassets/", StringComparison.OrdinalIgnoreCase);
+            var root = doc.RootElement;
+            if (UrlContains(root, "/contentassets/")) return true;
+            if (root.TryGetProperty("parentLink", out var parentLink) && parentLink.ValueKind == JsonValueKind.Object &&
+                UrlContains(parentLink, "/contentassets/")) return true;
         }
         catch { }
-        return false; // no URL → treat as global, preserve parentLink
+        return false;
     }
+
+    private static bool UrlContains(JsonElement obj, string fragment) =>
+        obj.TryGetProperty("url", out var u) && u.ValueKind == JsonValueKind.String &&
+        (u.GetString() ?? "").Contains(fragment, StringComparison.OrdinalIgnoreCase);
 
     // Block detection: we treat anything that is NOT media and NOT a page as block-like.
     // Checking for the literal string "Block" in contentType is too narrow — Shared Blocks
@@ -2342,8 +2752,12 @@ public class ContentTransferService : IContentTransferService
 
             if (response.Status == HttpStatusCode.Conflict)
             {
-                // Content already exists on target under a different parent — use the existing version.
-                _logger.LogDebug("{Guid} already exists on target with a different parent (InvalidParent) — reusing existing", guid);
+                // A 409 usually means the content already exists on target under a different parent
+                // (InvalidParent) — reuse the existing version. But it is also what a malformed write
+                // returns (e.g. a language branch that still carries culture-invariant properties), and
+                // silently reusing there hides a real failure. Log the body at Warning so it's never
+                // silent, then reuse the existing version.
+                _logger.LogWarning("409 Conflict writing {Guid} — reusing existing target version. Response: {Body}", guid, body);
                 return await GetTargetContentIdAsync(guid, target, token);
             }
 

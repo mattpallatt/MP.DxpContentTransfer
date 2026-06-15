@@ -42,7 +42,7 @@ public class DxpGadgetController : Controller
         var currentHost = _httpContextAccessor.HttpContext?.Request.Host.Host ?? string.Empty;
         var currentEnv = settings.DetectByHost(currentHost)?.Name;
 
-        var (contentName, isPage, isPublished) = ResolveContentInfo(contentId);
+        var (contentName, isPage, isPublished, languages) = ResolveContentInfo(contentId);
 
         var availableTargets = settings.AllEnvironments
             .Where(e => e.IsConfigured && !string.Equals(e.Name, currentEnv, StringComparison.OrdinalIgnoreCase))
@@ -56,31 +56,36 @@ public class DxpGadgetController : Controller
             AvailableTargets = availableTargets,
             IsSettingsConfigured = settings.AllEnvironments.Any(e => e.IsConfigured),
             IsPageContent = isPage,
-            IsPublished = isPublished
+            IsPublished = isPublished,
+            AvailableLanguages = languages
         };
 
         return View("~/Views/DxpGadget/Index.cshtml", model);
     }
 
-    private (string name, bool isPage, bool isPublished) ResolveContentInfo(string contentId)
+    private (string name, bool isPage, bool isPublished, List<LanguageOption> languages) ResolveContentInfo(string contentId)
     {
         if (string.IsNullOrWhiteSpace(contentId))
-            return ("(no page selected)", false, false);
+            return ("(no page selected)", false, false, new());
 
         var reference = ContentReferenceParser.Parse(contentId);
         if (ContentReference.IsNullOrEmpty(reference))
-            return (contentId, false, false);
+            return (contentId, false, false, new());
 
         try
         {
             var content = _contentLoader.Get<IContent>(reference);
             var isPage = content is PageData;
             var isPublished = !(content is IVersionable v) || v.Status == VersionStatus.Published;
-            return (content?.Name ?? contentId, isPage, isPublished);
+            var languages = new List<LanguageOption>();
+            if (content is ILocalizable loc && loc.ExistingLanguages != null)
+                foreach (var culture in loc.ExistingLanguages)
+                    languages.Add(new LanguageOption { Code = culture.Name, DisplayName = culture.EnglishName });
+            return (content?.Name ?? contentId, isPage, isPublished, languages);
         }
         catch
         {
-            return (contentId, false, false);
+            return (contentId, false, false, new());
         }
     }
 }
