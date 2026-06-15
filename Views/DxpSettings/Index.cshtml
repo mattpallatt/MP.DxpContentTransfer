@@ -161,7 +161,7 @@
             <li>
                 On that environment's site, register an OpenID&nbsp;Connect application for the
                 <code>client_credentials</code> grant. The quickest way is in that environment's CMS admin UI:
-                <strong>Settings&nbsp;&rarr; OpenID&nbsp;Connect &rarr; Applications &rarr; Create&nbsp;New&nbsp;Application</strong>
+                <strong>Settings&nbsp;&rarr; <a href="/EPiServer/EPiServer.OpenIDConnect.UI/Default/#/oidc/applications" target="_top">OpenID&nbsp;Connect</a> &rarr; Applications &rarr; Create&nbsp;New&nbsp;Application</strong>
                 &mdash; create a <em>Confidential</em> client, which gives you a <code>Client&nbsp;id</code> and a
                 generated secret. (Equivalently, applications can be declared in the host's configuration,
                 typically <code>appsettings.json</code> under <code>OpenIDConnect:Applications</code>, surfaced
@@ -178,6 +178,9 @@
             </li>
             <li>
                 Repeat for each environment you intend to use, then click <strong>Save Settings</strong>.
+            </li>
+            <li>
+                You will also have to give the Open ID account you have created, full read and write permissions for the pages that you want to transfer. This is done in the CMS admin UI, under <strong><a href="/EPiServer/EPiServer.Cms.UI.Admin/default#/AccessRights/SetAccessRights" target="_top">Admin &gt; Access Rights</a></strong>. You can create a new role for this purpose, and assign it to the Open ID account.
             </li>
         </ol>
         <p class="note">

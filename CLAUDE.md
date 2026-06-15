@@ -75,10 +75,11 @@ so the running build can be confirmed from the logs; keep it in sync with the pa
   Registered-but-not-found vs route-not-registered is separated only by response *shape* (a real API
   emits a JSON/problem body; a bare framework 404 doesn't), and even a bare 404 is reported as a pass
   with a soft advisory — never a hard fail.
-- `Services/ContentTransferService` — the engine (~2100 lines). Pre-check planning, the recursive
-  stub→blocks→media→full transfer cycle, JSON property surgery, deferred forward-reference patches,
-  placeholder fabrication, URL/domain relinking. The **pure** XHTML/JSON helpers have been lifted out
-  (see next two), leaving the stateful engine; it pulls the visitors back in via `using static`.
+- `Services/ContentTransferService` — the engine (~2500 lines). Pre-check planning, the recursive
+  stub→blocks→media→full transfer cycle, **per-language branch writes**, JSON property surgery, deferred
+  forward-reference patches, **page-local block placement** (deferred-until-folder-mapped), placeholder
+  fabrication, URL/domain relinking. The **pure** XHTML/JSON helpers have been lifted out (see next two),
+  leaving the stateful engine; it pulls the visitors back in via `using static`.
 - `Services/XhtmlProcessor` — pure PropertyXhtmlString processing: `ExtractXhtmlImageUrls`,
   `ExtractXhtmlContentFragments`/`ParseContentFragments`, `RewriteXhtmlUrls`, `NormalizeInlineImagePath`,
   `ToRelativePath`. No I/O or engine state, so it's directly unit-tested. The engine still drives it and
@@ -155,3 +156,43 @@ so the running build can be confirmed from the logs; keep it in sync with the pa
 - **`ContentNotVersionable` on write** (some blocks/folders): the CMA rejects `status`/`startPublish`/
   `stopPublish` on non-versionable content. `WriteToTargetAsync` detects this code and retries once
   with those fields stripped — don't remove that branch.
+- **Multilingual: every item transfers all its language branches** (`TransferItemCoreAsync` step 5 →
+  `WriteLanguageBranchesAsync`). The master language is written by the normal flow; then each language
+  in `existingLanguages` is read with an `Accept-Language` header and written as a **branch payload**
+  (`BuildLanguageBranchJson`). The CMA treats languages as separate objects sharing the culture-invariant
+  properties, so a branch write must send **only the culture-specific properties** — sending the
+  invariant ones is what returns **409 Conflict** (the bug that started this). Which properties are
+  culture-specific comes from `PropertyDefinition.LanguageSpecific`, pre-loaded into a `contentType →
+  names` map **on the HTTP thread** (DB-backed, same affinity rule as the content pre-load) and threaded
+  through as `LanguagePlan`. Each branch first runs `ProcessReferencedDependenciesAsync` on its own JSON,
+  so a block/media **referenced only from a non-master branch** is transferred too (the master pass's
+  `visited`/`idMap` dedup shared deps). **Known gap:** an inline rich-text *image* embedded only in a
+  non-master branch (not shared with the master, so not covered by the master's XHTML maps) is not yet
+  re-uploaded for the branch. Don't reinstate the old "409 ⇒ silently reuse existing" behaviour — it now
+  logs the body at Warning.
+  - **Language picker.** Pre-check returns `AvailableLanguages` (the union of `ILocalizable.ExistingLanguages`
+    across items, read **before the first await**). The gadget shows a multiselect in the plan view; no
+    ticks = "Transfer all languages" = `selectedLanguages` null/empty = every branch. Ticked locale codes
+    flow `TransferRequestModel.SelectedLanguages → TransferAsync → LanguagePlan.Includes`. The master
+    language **always** transfers (it's the prerequisite for any branch); selection narrows the *extras*.
+- **Page-local "For This Page" placement is the deepest rabbit hole — read this before touching block
+  parenting.** A page/block's local assets live in a `SysContentAssetFolder` whose GUID is **generated
+  per environment** (stored as the owner's `ContentAssetsID`, not derivable, not exposed by the CMA) and
+  parented by the global `/contentassets/` root, not the owner. Optimizely **routes page-local *media***
+  parented-by-owner into that folder automatically (creating it on first upload), but does **NOT route
+  page-local *blocks*** — a block parented by the owner is orphaned directly under the page. The pipeline
+  (`ProcessReferencedDependenciesAsync` + `TransferDeferredLocalBlocksAsync`):
+  1. `IsLocalContent` detects local content by the item's `url` **and** its `parentLink.url` containing
+     `/contentassets/` (the CMA returns `url:null` for asset-folder content — checking only `url` was the
+     misdetection that orphaned blocks).
+  2. Local **blocks are deferred** (collected, not transferred inline) until *after* the page write and
+     local-media upload, because the target folder GUID isn't known until then.
+  3. As local media transfers, `CaptureFolderMappingAsync` records source-folder → target-folder in
+     `LanguagePlan.FolderMap` (the routed media's `parentLink` reveals the target folder GUID). Deferred
+     local blocks reuse that map to land in the **same folder as their sibling assets**.
+  4. Folder with no sibling media → `ResolveAssetFolderGuidAsync` **probes**: PUTs a 1×1 image to the owner
+     (Optimizely creates+links the folder + routes the image), reads the folder GUID off its `parentLink`,
+     deletes the probe (the folder stays). Needs the owner to exist on target — which is *why* blocks are
+     deferred to after the page write.
+  Do **not** parent a local block by the owner (orphans it under the page) or by the source folder GUID via
+  `EnsureContentParentAsync` (creates an orphan *copy* of the folder) — both were tried and both fail.
