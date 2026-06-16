@@ -161,6 +161,12 @@
         .lang-item input { margin: 0; cursor: pointer; }
         .lang-item .lang-name { text-transform: capitalize; }
         .lang-item .lang-code { color: #999; }
+        .lang-item-master { cursor: default; }
+        .lang-item-master input:disabled { cursor: default; }
+        .lang-master-tag {
+            margin-left: auto; font-size: 11px; font-weight: 500; color: #2973c3;
+            background: #e8f0fb; border-radius: 8px; padding: 1px 7px;
+        }
     </style>
 </head>
 <body>
@@ -227,10 +233,22 @@ else
                     <div class="lang-menu" id="dxp-lang-menu" style="display:none">
                         @foreach (var lang in Model.AvailableLanguages)
                         {
-                            <label class="lang-item">
-                                <input type="checkbox" value="@lang.Code" onchange="dxpTransfer.updateLangText()" />
+                            <label class="lang-item@(lang.IsMaster ? " lang-item-master" : "")"
+                                   title="@(lang.IsMaster ? "Master language — always transferred" : "")">
+                                @if (lang.IsMaster)
+                                {
+                                    <input type="checkbox" value="@lang.Code" checked="checked" disabled onchange="dxpTransfer.updateLangText()" />
+                                }
+                                else
+                                {
+                                    <input type="checkbox" value="@lang.Code" checked="checked" onchange="dxpTransfer.updateLangText()" />
+                                }
                                 <span class="lang-name">@lang.DisplayName</span>
                                 <span class="lang-code">[@lang.Code]</span>
+                                @if (lang.IsMaster)
+                                {
+                                    <span class="lang-master-tag">master</span>
+                                }
                             </label>
                         }
                     </div>
@@ -461,19 +479,25 @@ var dxpTransfer = (function () {
     // The picker is server-rendered on the form (only when the content has 2+ languages); no boxes
     // ticked = "transfer all languages". These helpers no-op gracefully when the picker is absent.
 
+    // The selection sent to the backend is the ticked NON-master languages. The master is excluded
+    // here because it always transfers regardless; an empty list therefore means "master only".
     function getSelectedLanguages() {
         return Array.prototype.slice
-            .call(document.querySelectorAll('#dxp-lang-menu input:checked'))
+            .call(document.querySelectorAll('#dxp-lang-menu input:checked:not(:disabled)'))
             .map(function (cb) { return cb.value; });
     }
 
+    // Toggle text counts every ticked box (master included, since it's always on): all ticked reads
+    // "All Languages"; a subset reads "N Languages selected".
     function updateLangText() {
         var text = document.getElementById('dxp-lang-text');
         if (!text) return;
-        var selected = getSelectedLanguages();
-        text.textContent =
-            selected.length === 0 ? 'All Languages'
-            : selected.length + ' Language' + (selected.length === 1 ? '' : 's') + ' selected';
+        var all = document.querySelectorAll('#dxp-lang-menu input');
+        if (all.length === 0) return;
+        var checked = document.querySelectorAll('#dxp-lang-menu input:checked').length;
+        text.textContent = (checked === all.length)
+            ? 'All Languages'
+            : checked + ' Language' + (checked === 1 ? '' : 's') + ' selected';
     }
 
     // ── Row-level progress polling ──────────────────────────
@@ -892,6 +916,7 @@ var dxpTransfer = (function () {
     });
 
     updateCheckBtn();
+    updateLangText();
 
     return { check: check, confirm: confirm, cancel: cancel, downloadLog: downloadLog, toggleLangMenu: toggleLangMenu, updateLangText: updateLangText };
 })();

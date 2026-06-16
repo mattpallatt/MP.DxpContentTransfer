@@ -21,4 +21,8 @@ public class LanguageOption
 {
     public string Code { get; set; }
     public string DisplayName { get; set; }
+
+    // The master language is a structural prerequisite — it always transfers (it owns the
+    // culture-invariant properties), so the picker pins it checked-and-disabled.
+    public bool IsMaster { get; set; }
 }

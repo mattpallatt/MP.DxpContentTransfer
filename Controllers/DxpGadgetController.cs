@@ -79,8 +79,18 @@ public class DxpGadgetController : Controller
             var isPublished = !(content is IVersionable v) || v.Status == VersionStatus.Published;
             var languages = new List<LanguageOption>();
             if (content is ILocalizable loc && loc.ExistingLanguages != null)
+            {
+                var masterCode = loc.MasterLanguage?.Name;
                 foreach (var culture in loc.ExistingLanguages)
-                    languages.Add(new LanguageOption { Code = culture.Name, DisplayName = culture.EnglishName });
+                    languages.Add(new LanguageOption
+                    {
+                        Code = culture.Name,
+                        DisplayName = culture.EnglishName,
+                        IsMaster = string.Equals(culture.Name, masterCode, StringComparison.OrdinalIgnoreCase)
+                    });
+                // Pin the master language first so the picker lists it at the top.
+                languages = languages.OrderByDescending(l => l.IsMaster).ToList();
+            }
             return (content?.Name ?? contentId, isPage, isPublished, languages);
         }
         catch

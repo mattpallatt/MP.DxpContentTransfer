@@ -94,7 +94,10 @@ public class DxpTransferApiController : ControllerBase
                     request.TransferStatus ?? "Published",
                     request.Plan,
                     onItemComplete: () => Interlocked.Increment(ref job.Completed),
-                    selectedLanguages: request.SelectedLanguages is { Count: > 0 } ? request.SelectedLanguages : null);
+                    // Pass the selection through verbatim: null = transfer all languages (no picker / not
+                    // sent), a non-empty list = those branches, an empty list = master language only. The
+                    // master always transfers regardless; the list only narrows the extra branches.
+                    selectedLanguages: request.SelectedLanguages);
                 job.Result = result;
             }
             catch (Exception ex)
