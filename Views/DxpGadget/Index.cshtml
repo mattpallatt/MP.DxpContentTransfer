@@ -34,8 +34,22 @@
             background: #fff; color: #1a1a1a;
         }
         select:focus { outline: none; border-color: #2973c3; box-shadow: 0 0 0 2px rgba(41,115,195,0.2); }
-        .checkbox-row { display: flex; align-items: center; gap: 7px; margin-bottom: 9px; }
+        .checkbox-row { display: flex; align-items: center; gap: 7px; margin-bottom: 9px; position: relative; }
         .checkbox-row label { margin: 0; font-weight: 400; font-size: 14px; }
+        /* (?) help icon + hover/focus tooltip, styled after the Optimizely field-help affordance. */
+        .help {
+            display: inline-flex; align-items: center; justify-content: center;
+            width: 15px; height: 15px; border-radius: 50%; border: 1px solid #999;
+            color: #777; font-size: 11px; font-weight: 600; line-height: 1;
+            cursor: help; flex-shrink: 0;
+        }
+        .help:hover, .help:focus { border-color: #2973c3; color: #2973c3; outline: none; }
+        .help-bubble {
+            display: none; position: absolute; z-index: 30; top: calc(100% + 4px); left: 0; right: 0;
+            background: #333; color: #fff; font-size: 12px; font-weight: 400; line-height: 1.45;
+            padding: 7px 9px; border-radius: 4px; box-shadow: 0 2px 8px rgba(0,0,0,0.25);
+        }
+        .help:hover .help-bubble, .help:focus .help-bubble { display: block; }
         .radio-group { margin-bottom: 12px; }
         .radio-group .radio-row { display: flex; align-items: center; gap: 7px; margin-bottom: 6px; }
         .radio-group .radio-row label { margin: 0; font-weight: 400; font-size: 14px; }
@@ -115,7 +129,7 @@
         }
         /* One-line field rows: label + control side by side (shared by the language + environment pickers). */
         .field-row { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
-        .field-label { flex: 0 0 130px; margin: 0; font-size: 14px; font-weight: 500; color: #333; white-space: nowrap; }
+        .field-label { flex: 0 0 130px; margin: 0; font-size: 14px; font-weight: 500; color: #333; line-height: 1.3; }
         /* Match the native select to the custom language toggle: strip the OS chrome, add the same caret. */
         .field-row select {
             flex: 1; width: auto; margin-bottom: 0;
@@ -192,7 +206,7 @@ else
         <div class="section-title">Transfer Options</div>
 
         <div class="field-row">
-            <label class="field-label" for="dxp-target">Environment</label>
+            <label class="field-label" for="dxp-target">Destination<br />Environment</label>
             <select id="dxp-target">
             @foreach (var env in Model.AvailableTargets)
             {
@@ -225,7 +239,7 @@ else
         }
 
         <div class="field-row">
-            <label class="field-label" for="dxp-state">State</label>
+            <label class="field-label" for="dxp-state">Published<br /> State</label>
             <select id="dxp-state">
                 <option value="Published" selected>Published</option>
                 <option value="CheckedOut">Draft</option>
@@ -237,11 +251,17 @@ else
         <div class="checkbox-row">
             <input type="checkbox" id="dxp-children" />
             <label for="dxp-children">Include Child Pages</label>
+            <span class="help" tabindex="0">?
+                <span class="help-bubble">When checked, all pages nested beneath this page will also be transferred. Leave unchecked to transfer only this page with related blocks and assets.</span>
+            </span>
         </div>
 
         <div class="checkbox-row">
             <input type="checkbox" id="dxp-overwrite" />
             <label for="dxp-overwrite">Overwrite Matched Pages</label>
+            <span class="help" tabindex="0">?
+                <span class="help-bubble">When checked, any page in the destination environment with a matching URL will be replaced. Leave unchecked to create a new version of the page with associated blocks and assets.</span>
+            </span>
         </div>
 
         <button id="dxp-check-btn" onclick="dxpTransfer.check()">Check Transfer Plan</button>
