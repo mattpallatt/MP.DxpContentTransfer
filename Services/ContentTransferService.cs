@@ -33,7 +33,7 @@ public class ContentTransferService : IContentTransferService
 
     // Bumped whenever behaviour changes, and logged at the start of every pre-check/transfer so the
     // running build can be confirmed from the logs. Keep in sync with the package version.
-    private const string BuildMarker = "0.6.0 (multilingual transfer + language picker)";
+    private const string BuildMarker = "0.7.1 (pinned-master picker + environment indicator)";
 
     public ContentTransferService(
         IDxpSettingsService settingsService,

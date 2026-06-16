@@ -23,6 +23,9 @@ public static class ServiceCollectionExtensions
         // Inject the admin settings-page bootstrap script into admin pages automatically.
         services.AddTransient<IStartupFilter, DxpAdminScriptStartupFilter>();
 
+        // Badge the matched DXP environment into the shell's top navigation bar.
+        services.AddTransient<IStartupFilter, DxpEnvIndicatorStartupFilter>();
+
         services.Configure<ProtectedModuleOptions>(opts =>
         {
             if (!opts.Items.Any(x => string.Equals(x.Name, "DxpContentTransfer", StringComparison.OrdinalIgnoreCase)))

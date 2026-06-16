@@ -1,8 +1,9 @@
 using Microsoft.AspNetCore.Http;
-using System.Text;
 
 namespace DxpContentTransfer.Middleware;
 
+// Injects the admin settings bootstrap script into every admin page (so the tools-menu route can
+// render the settings iframe). The buffer-and-splice logic lives in HtmlBodyInjector.
 public class DxpAdminScriptMiddleware(RequestDelegate next)
 {
     private const string AdminPath = "/EPiServer/EPiServer.Cms.UI.Admin";
@@ -16,53 +17,7 @@ public class DxpAdminScriptMiddleware(RequestDelegate next)
             return;
         }
 
-        var originalBody = context.Response.Body;
-        using var buffer = new MemoryStream();
-        context.Response.Body = buffer;
-
-        try
-        {
-            await next(context);
-        }
-        finally
-        {
-            context.Response.Body = originalBody;
-        }
-
-        buffer.Position = 0;
-        var contentType = context.Response.ContentType ?? string.Empty;
-
-        if (!contentType.Contains("text/html", StringComparison.OrdinalIgnoreCase))
-        {
-            await buffer.CopyToAsync(originalBody);
-            return;
-        }
-
-        var html = await new StreamReader(buffer, Encoding.UTF8).ReadToEndAsync();
-
-        // Idempotent: if the tag is already present (e.g. the host also registered this
-        // middleware), write the body through untouched rather than injecting a second copy.
-        if (html.Contains(ScriptTag, StringComparison.OrdinalIgnoreCase))
-        {
-            buffer.Position = 0;
-            await buffer.CopyToAsync(originalBody);
-            return;
-        }
-
-        var bodyClose = html.LastIndexOf("</body>", StringComparison.OrdinalIgnoreCase);
-
-        if (bodyClose < 0)
-        {
-            var raw = Encoding.UTF8.GetBytes(html);
-            context.Response.ContentLength = raw.Length;
-            await originalBody.WriteAsync(raw);
-            return;
-        }
-
-        var modified = html[..bodyClose] + ScriptTag + html[bodyClose..];
-        var bytes = Encoding.UTF8.GetBytes(modified);
-        context.Response.ContentLength = bytes.Length;
-        await originalBody.WriteAsync(bytes);
+        await HtmlBodyInjector.InjectBeforeBodyCloseAsync(context, next, ScriptTag);
     }
 
     private static bool IsAdminPageRequest(HttpContext context)
