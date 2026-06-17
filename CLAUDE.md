@@ -65,7 +65,19 @@ so the running build can be confirmed from the logs; keep it in sync with the pa
   `ConcurrentDictionary` — **it does not survive an app-pool recycle**; that's a known tradeoff.
 - `Controllers/DxpSettingsController` + `Views/DxpSettings` — admin page for per-environment
   credentials (admin roles only). Also exposes `Admin/TestConnection` (AJAX), backed by
-  `EnvironmentHealthService`, for the per-environment "Test connection" button.
+  `EnvironmentHealthService`, for the per-environment "Test connection" button. The settings also
+  carry the **environment-indicator** badge config (per-env colour + label, a global selector
+  override, and the Production-on toggle); the page updates the live badge in the parent shell on save.
+- **Environment indicator** — badges the running environment into the CMS top bar.
+  `Controllers/DxpClientResourceController` serves two controller-route scripts (no static assets):
+  `AdminInit.js` (overlays the settings page in the admin SPA) and `EnvIndicator.js` (the badge,
+  resolved server-side via `DetectByHost` + an `ASPNETCORE_ENVIRONMENT` dev fallback, with name/label/
+  colour/contrast-text/selector baked in). `Middleware/DxpAdminScriptMiddleware` + `DxpEnvIndicatorMiddleware`
+  inject those `<script>` tags into admin/shell HTML (shared `HtmlBodyInjector`, auto-registered via
+  `IStartupFilter`). `Services/EnvironmentBadge` holds the presentation logic (default colour, effective
+  label, WCAG-contrast text colour at luminance 0.179, default selector). The badge carries
+  `data-dxp-env` (identity) separate from its display label so the live update keys off identity, not text.
+  NB: a standalone `MP.DxpEnvironmentIndicator` package mirrors this; the two are independent copies.
 - `Services/EnvironmentHealthService` — the "Test connection" probe: fetches a client-credentials
   token (catches the CORS-500 / bad-secret case), checks the granted scope, then GETs the CMA for a
   throwaway GUID. **A 404 here is SUCCESS, not failure** — a healthy CMA 404s a non-existent GUID

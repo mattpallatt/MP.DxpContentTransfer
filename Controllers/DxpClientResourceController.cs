@@ -3,6 +3,7 @@ using DxpContentTransfer.Services;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Hosting;
 
 namespace DxpContentTransfer.Controllers;
 
@@ -20,35 +21,50 @@ public class DxpClientResourceController(IDxpSettingsService settingsService, IW
         Content(AdminInitScript, "application/javascript; charset=utf-8");
 
     // Badges the running environment into the shell's top navigation bar, resolved server-side and
-    // baked into the script (no client-side fetch). Primary source is DetectByHost (the same match
-    // the gadget uses) so a real DXP slot reads Integration/Preproduction/Production; when the host
-    // matches nothing (e.g. localhost) it falls back to ASPNETCORE_ENVIRONMENT so local dev still
-    // shows a badge. Production stays silent (a missing badge is the "you're on prod" signal).
+    // baked into the script (no client-side fetch, no response cache so colour/label/selector changes
+    // take effect on the next load). The matched environment (DetectByHost — the same match the gadget
+    // uses) supplies its configured colour and label; an unmatched host falls back to
+    // ASPNETCORE_ENVIRONMENT so local dev still shows a badge. Production is badged unless opted out.
     [HttpGet]
     [Route("~/EPiServer/DxpContentTransfer/ClientResources/Scripts/EnvIndicator.js")]
-    [ResponseCache(Duration = 60)]
     public IActionResult EnvIndicator()
     {
-        var env = settingsService.Get().DetectByHost(Request.Host.Host ?? string.Empty)?.Name
-                  ?? hostEnvironment.EnvironmentName;
-        var color = EnvColor(env);
-        if (string.IsNullOrEmpty(env) || color == null)
-            return Content("/* DXP environment indicator: no badge for this environment */", "application/javascript; charset=utf-8");
+        var settings = settingsService.Get();
+        var matched = settings.DetectByHost(Request.Host.Host ?? string.Empty);
 
-        var prelude = $"var __DXP_ENV={JsonSerializer.Serialize(env.ToUpperInvariant())};"
-                    + $"var __DXP_COLOR={JsonSerializer.Serialize(color)};\n";
+        string name, label, color;
+        if (matched != null)
+        {
+            if (string.Equals(matched.Name, "Production", StringComparison.OrdinalIgnoreCase) && !settings.ShowOnProduction)
+                return Inert();
+            name = matched.Name;
+            color = string.IsNullOrWhiteSpace(matched.Color) ? EnvironmentBadge.DefaultColor(name) : matched.Color;
+            label = EnvironmentBadge.EffectiveLabel(name, matched.Label);
+        }
+        else if (hostEnvironment.IsDevelopment())
+        {
+            name = "Development";
+            color = EnvironmentBadge.DefaultColor(name);
+            label = EnvironmentBadge.EffectiveLabel(name, null);
+        }
+        else
+        {
+            return Inert();
+        }
+
+        if (string.IsNullOrEmpty(color)) return Inert();
+
+        var selector = string.IsNullOrWhiteSpace(settings.Selector) ? EnvironmentBadge.DefaultSelector : settings.Selector;
+        var prelude = $"var __DXP_ENV={JsonSerializer.Serialize(name)};"
+                    + $"var __DXP_LABEL={JsonSerializer.Serialize(label)};"
+                    + $"var __DXP_COLOR={JsonSerializer.Serialize(color)};"
+                    + $"var __DXP_TEXT={JsonSerializer.Serialize(EnvironmentBadge.TextColor(color))};"
+                    + $"var __DXP_SELECTOR={JsonSerializer.Serialize(selector)};\n";
         return Content(prelude + EnvIndicatorScript, "application/javascript; charset=utf-8");
     }
 
-    // Integration/Preproduction (and a local Development fallback) get a coloured badge; Production
-    // stays silent — a missing badge is the signal you're on prod — as does any unrecognised name.
-    private static string EnvColor(string env) => env?.ToLowerInvariant() switch
-    {
-        "integration" => "#d4651a",
-        "preproduction" => "#7b2fff",
-        "development" => "#2e7d32",
-        _ => null,
-    };
+    private ContentResult Inert() =>
+        Content("/* DXP environment indicator: no badge for this environment */", "application/javascript; charset=utf-8");
 
     // The admin tools menu item points at the SPA hash route "#/DxpTransfer/Settings". The admin
     // SPA has no handler for that route, so on its own it shows a blank content area. This script
@@ -167,20 +183,20 @@ public class DxpClientResourceController(IDxpSettingsService settingsService, IW
     // that never show the bar (e.g. login) don't observe forever.
     private const string EnvIndicatorScript = """
     (function () {
-        var LABEL = '.epi-pn-navigation__section--align-center .flex--1.truncate';
         var deadline = Date.now() + 15000;
 
         function apply() {
-            var label = document.querySelector(LABEL);
+            var label = document.querySelector(__DXP_SELECTOR);
             if (!label) return false;
             var host = label.closest('.oui-dropdown-group') || label.closest('.oui-button') || label.parentElement;
             if (!host || !host.parentElement) return false;
             if (host.parentElement.querySelector('.dxp-env-badge')) return true;
             var badge = document.createElement('span');
             badge.className = 'dxp-env-badge';
-            badge.textContent = __DXP_ENV;
+            badge.setAttribute('data-dxp-env', __DXP_ENV);
+            badge.textContent = __DXP_LABEL;
             badge.style.cssText = 'display:inline-flex;align-items:center;padding:1px 7px;background:' + __DXP_COLOR +
-                ';color:#fff;font-size:11px;font-weight:700;border-radius:3px;letter-spacing:0.5px;' +
+                ';color:' + __DXP_TEXT + ';font-size:11px;font-weight:700;border-radius:3px;letter-spacing:0.5px;' +
                 'margin-left:8px;flex-shrink:0;white-space:nowrap;';
             host.insertAdjacentElement('afterend', badge);
             return true;
