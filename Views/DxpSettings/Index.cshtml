@@ -143,6 +143,12 @@
         .badge-row { display: flex; gap: 16px; align-items: flex-end; flex-wrap: wrap; margin-bottom: 14px; }
         .badge-row .field { margin-bottom: 0; }
         .badge-label { flex: 1; min-width: 180px; }
+        .badge-preview-wrap { flex: 0 0 auto; }
+        .badge-preview {
+            display: inline-flex; align-items: center; height: 34px; padding: 0 9px;
+            border-radius: 3px; font-size: 11px; font-weight: 700; letter-spacing: 0.5px;
+            white-space: nowrap; color: #fff; background: #888;
+        }
         .badge-colour { flex: 0 0 auto; }
         .badge-colour input[type=color] { width: 46px; height: 34px; padding: 0; border: 1px solid #bbb; border-radius: 4px; background: #fff; cursor: pointer; }
         .checkbox-field { margin-top: 4px; }
@@ -243,6 +249,10 @@
                     <label for="IntegrationColor">Badge colour</label>
                     <input type="color" id="IntegrationColor" name="IntegrationColor" value="@(Model.IntegrationColor ?? "#d4651a")" />
                 </div>
+                <div class="field badge-preview-wrap">
+                    <label>Preview</label>
+                    <span class="badge-preview" data-env="Integration" data-default="INTEGRATION">INTEGRATION</span>
+                </div>
             </div>
             <div class="field-test">
                 <button type="button" class="btn-test" data-env="Integration">Test connection</button>
@@ -276,6 +286,10 @@
                     <label for="PreproductionColor">Badge colour</label>
                     <input type="color" id="PreproductionColor" name="PreproductionColor" value="@(Model.PreproductionColor ?? "#7b2fff")" />
                 </div>
+                <div class="field badge-preview-wrap">
+                    <label>Preview</label>
+                    <span class="badge-preview" data-env="Preproduction" data-default="PREPRODUCTION">PREPRODUCTION</span>
+                </div>
             </div>
             <div class="field-test">
                 <button type="button" class="btn-test" data-env="Preproduction">Test connection</button>
@@ -308,6 +322,10 @@
                 <div class="field badge-colour">
                     <label for="ProductionColor">Badge colour</label>
                     <input type="color" id="ProductionColor" name="ProductionColor" value="@(Model.ProductionColor ?? "#c0392b")" />
+                </div>
+                <div class="field badge-preview-wrap">
+                    <label>Preview</label>
+                    <span class="badge-preview" data-env="Production" data-default="PRODUCTION">PRODUCTION</span>
                 </div>
             </div>
             <div class="field-test">
@@ -400,6 +418,43 @@
                     var result = document.querySelector('.test-result[data-env="' + env + '"]');
                     runTest(env, button, result);
                 });
+            });
+        })();
+    </script>
+
+    <script>
+        // Live preview of each environment's badge: updates as the colour/label change, with the same
+        // WCAG-contrast text colour the server bakes into the real badge (luminance crossover 0.179).
+        (function () {
+            function contrastText(hex) {
+                var m = /^#?([0-9a-f]{3}|[0-9a-f]{6})$/i.exec((hex || '').trim());
+                if (!m) return '#ffffff';
+                var h = m[1];
+                if (h.length === 3) h = h[0] + h[0] + h[1] + h[1] + h[2] + h[2];
+                function lin(c) { c /= 255; return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); }
+                var L = 0.2126 * lin(parseInt(h.substr(0, 2), 16))
+                      + 0.7152 * lin(parseInt(h.substr(2, 2), 16))
+                      + 0.0722 * lin(parseInt(h.substr(4, 2), 16));
+                return L > 0.179 ? '#1a1a1a' : '#ffffff';
+            }
+
+            function update(env) {
+                var labelEl = document.getElementById(env + 'Label');
+                var colorEl = document.getElementById(env + 'Color');
+                var pill = document.querySelector('.badge-preview[data-env="' + env + '"]');
+                if (!pill || !colorEl) return;
+                var label = (labelEl && labelEl.value.trim()) || pill.getAttribute('data-default');
+                pill.textContent = label;
+                pill.style.background = colorEl.value;
+                pill.style.color = contrastText(colorEl.value);
+            }
+
+            ['Integration', 'Preproduction', 'Production'].forEach(function (env) {
+                var l = document.getElementById(env + 'Label');
+                var c = document.getElementById(env + 'Color');
+                if (l) l.addEventListener('input', function () { update(env); });
+                if (c) c.addEventListener('input', function () { update(env); });
+                update(env);
             });
         })();
     </script>

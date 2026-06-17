@@ -33,7 +33,7 @@ public class ContentTransferService : IContentTransferService
 
     // Bumped whenever behaviour changes, and logged at the start of every pre-check/transfer so the
     // running build can be confirmed from the logs. Keep in sync with the package version.
-    private const string BuildMarker = "0.8.0 (configurable environment indicator: colours, labels, selector)";
+    private const string BuildMarker = "0.9.0 (environment indicator: poll placement, auth, colour preview)";
 
     public ContentTransferService(
         IDxpSettingsService settingsService,

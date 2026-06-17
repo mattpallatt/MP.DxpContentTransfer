@@ -11,7 +11,11 @@ namespace DxpContentTransfer.Controllers;
 // top-bar environment badge). Each is referenced by an injecting middleware. Served from a
 // controller (rather than a packaged static asset) so the class library is self-contained — there
 // is no host-side ClientResources folder to deploy.
-[AllowAnonymous]
+//
+// Requires an authenticated user (not a specific role): both scripts are only ever loaded inside the
+// already-authenticated CMS shell, so the auth cookie rides along — while keeping EnvIndicator.js
+// (which names the environment) off any anonymous, bot-discoverable endpoint.
+[Authorize]
 public class DxpClientResourceController(IDxpSettingsService settingsService, IWebHostEnvironment hostEnvironment) : Controller
 {
     [HttpGet]
@@ -174,23 +178,27 @@ public class DxpClientResourceController(IDxpSettingsService settingsService, IW
     })();
     """;
 
-    // Reads __DXP_ENV / __DXP_COLOR from the prelude prepended by EnvIndicator(). Finds the product
-    // label cell ("CMS") in the top navigation's centre section and inserts a coloured environment
-    // pill immediately after it, so the bar reads "CMS [ENV]". The badge is appended (not an
-    // innerHTML rewrite) so it survives the SPA re-rendering the label, and is idempotent via the
-    // .dxp-env-badge marker. The shell renders asynchronously (React), so it retries via a
-    // MutationObserver until the cell exists, then disconnects — with a hard 15s deadline so pages
-    // that never show the bar (e.g. login) don't observe forever.
+    // Reads __DXP_ENV / __DXP_LABEL / __DXP_COLOR / __DXP_TEXT / __DXP_SELECTOR from the prelude
+    // prepended by EnvIndicator(). Finds the product label cell ("CMS") in the top navigation's
+    // centre section and inserts a coloured environment pill immediately after it, so the bar reads
+    // "CMS [ENV]". The badge carries data-dxp-env (identity) separate from its display label.
+    //
+    // Placement uses a light periodic poll rather than a subtree MutationObserver: the observer would
+    // fire on every DOM change in the (very noisy) CMS shell, whereas apply() is idempotent and cheap
+    // (one querySelector per tick, then an early return once the badge is present). Polling for the
+    // session also means the badge self-heals if React/Dojo re-renders the top bar and strips our
+    // node (e.g. switching Edit/Admin or toggling the nav) — the observer, which disconnected after
+    // the first insert, could not.
     private const string EnvIndicatorScript = """
     (function () {
-        var deadline = Date.now() + 15000;
+        var POLL_MS = 500;
 
         function apply() {
             var label = document.querySelector(__DXP_SELECTOR);
-            if (!label) return false;
+            if (!label) return;
             var host = label.closest('.oui-dropdown-group') || label.closest('.oui-button') || label.parentElement;
-            if (!host || !host.parentElement) return false;
-            if (host.parentElement.querySelector('.dxp-env-badge')) return true;
+            if (!host || !host.parentElement) return;
+            if (host.parentElement.querySelector('.dxp-env-badge')) return;
             var badge = document.createElement('span');
             badge.className = 'dxp-env-badge';
             badge.setAttribute('data-dxp-env', __DXP_ENV);
@@ -199,22 +207,10 @@ public class DxpClientResourceController(IDxpSettingsService settingsService, IW
                 ';color:' + __DXP_TEXT + ';font-size:11px;font-weight:700;border-radius:3px;letter-spacing:0.5px;' +
                 'margin-left:8px;flex-shrink:0;white-space:nowrap;';
             host.insertAdjacentElement('afterend', badge);
-            return true;
         }
 
-        function start() {
-            if (apply()) return;
-            var obs = new MutationObserver(function () {
-                if (apply() || Date.now() > deadline) obs.disconnect();
-            });
-            obs.observe(document.body, { childList: true, subtree: true });
-            setTimeout(function () { obs.disconnect(); }, 15000);
-        }
-
-        if (document.readyState === 'loading')
-            document.addEventListener('DOMContentLoaded', start);
-        else
-            start();
+        apply();
+        setInterval(apply, POLL_MS);
     })();
     """;
 }
