@@ -40,7 +40,8 @@ public class DxpGadgetController : Controller
         var contentId = Request.Query["id"].ToString();
         var settings = _settingsService.Get();
         var currentHost = _httpContextAccessor.HttpContext?.Request.Host.Host ?? string.Empty;
-        var currentEnv = settings.DetectByHost(currentHost)?.Name;
+        var currentConfig = settings.DetectByHost(currentHost);
+        var currentEnv = currentConfig?.Name;
 
         var (contentName, isPage, isPublished, languages) = ResolveContentInfo(contentId);
 
@@ -53,6 +54,7 @@ public class DxpGadgetController : Controller
             ContentId = contentId,
             ContentName = contentName,
             CurrentEnvironmentName = currentEnv ?? "Unknown",
+            CurrentEnvironmentLabel = currentConfig?.DisplayName ?? "Unknown",
             AvailableTargets = availableTargets,
             IsSettingsConfigured = settings.AllEnvironments.Any(e => e.IsConfigured),
             IsPageContent = isPage,

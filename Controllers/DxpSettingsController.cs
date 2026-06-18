@@ -48,14 +48,9 @@ public class DxpSettingsController : Controller
                 ProductionClientKey = model.ProductionClientKey?.Trim(),
                 ProductionClientSecret = model.ProductionClientSecret?.Trim(),
 
-                IntegrationColor = model.IntegrationColor?.Trim(),
                 IntegrationLabel = Clean(model.IntegrationLabel),
-                PreproductionColor = model.PreproductionColor?.Trim(),
                 PreproductionLabel = Clean(model.PreproductionLabel),
-                ProductionColor = model.ProductionColor?.Trim(),
-                ProductionLabel = Clean(model.ProductionLabel),
-                Selector = Clean(model.Selector),
-                ShowOnProduction = model.ShowOnProduction
+                ProductionLabel = Clean(model.ProductionLabel)
             };
 
             _settingsService.Save(settings);
@@ -101,14 +96,9 @@ public class DxpSettingsController : Controller
         ProductionClientKey = settings.Production?.ClientKey,
         ProductionClientSecret = settings.Production?.ClientSecret,
 
-        IntegrationColor = string.IsNullOrWhiteSpace(settings.Integration?.Color) ? EnvironmentBadge.DefaultColor("Integration") : settings.Integration.Color,
         IntegrationLabel = settings.Integration?.Label,
-        PreproductionColor = string.IsNullOrWhiteSpace(settings.Preproduction?.Color) ? EnvironmentBadge.DefaultColor("Preproduction") : settings.Preproduction.Color,
         PreproductionLabel = settings.Preproduction?.Label,
-        ProductionColor = string.IsNullOrWhiteSpace(settings.Production?.Color) ? EnvironmentBadge.DefaultColor("Production") : settings.Production.Color,
-        ProductionLabel = settings.Production?.Label,
-        Selector = settings.Selector,
-        ShowOnProduction = settings.ShowOnProduction
+        ProductionLabel = settings.Production?.Label
     };
 
     private static string Clean(string value) => string.IsNullOrWhiteSpace(value) ? null : value.Trim();

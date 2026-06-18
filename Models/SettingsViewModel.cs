@@ -14,15 +14,10 @@ public class SettingsViewModel
     public string ProductionClientKey { get; set; }
     public string ProductionClientSecret { get; set; }
 
-    // Environment-indicator badge settings.
-    public string IntegrationColor { get; set; }
+    // Optional friendly display labels for the transfer UI.
     public string IntegrationLabel { get; set; }
-    public string PreproductionColor { get; set; }
     public string PreproductionLabel { get; set; }
-    public string ProductionColor { get; set; }
     public string ProductionLabel { get; set; }
-    public string Selector { get; set; }
-    public bool ShowOnProduction { get; set; } = true;
 
     public bool Saved { get; set; }
     public string ErrorMessage { get; set; }

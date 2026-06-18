@@ -195,7 +195,7 @@ else if (!Model.AvailableTargets.Any())
     <div class="warning">
         @if (Model.CurrentEnvironmentName != "Unknown")
         {
-            <span>Running on <strong>@Model.CurrentEnvironmentName</strong>. No other configured environments available.</span>
+            <span>Running on <strong>@Model.CurrentEnvironmentLabel</strong>. No other configured environments available.</span>
         }
         else
         {
@@ -216,7 +216,7 @@ else
             <select id="dxp-target">
             @foreach (var env in Model.AvailableTargets)
             {
-                <option value="@env.Name">@env.Name</option>
+                <option value="@env.Name">@env.DisplayName</option>
             }
             </select>
         </div>
@@ -308,7 +308,7 @@ else
 <script>
 var dxpTransfer = (function () {
     var contentId = '@Html.Raw(Model.ContentId)';
-    var currentEnv = @Html.Raw(System.Text.Json.JsonSerializer.Serialize(Model.CurrentEnvironmentName));
+    var currentEnv = @Html.Raw(System.Text.Json.JsonSerializer.Serialize(Model.CurrentEnvironmentLabel));
     var plan = null;
     var pollTimer = null;
     var planRows = [];      // flat ordered list for polling: dep rows come before their page row
@@ -342,11 +342,13 @@ var dxpTransfer = (function () {
         var btn = document.getElementById('dxp-check-btn');
         if (!btn) return;
         var target = document.getElementById('dxp-target');
-        var targetName = target ? target.value : '';
-        if (!targetName) { btn.textContent = 'Check Transfer Plan'; return; }
+        // Display the selected option's label (its text), not its value (the canonical name).
+        var opt = target && target.selectedIndex >= 0 ? target.options[target.selectedIndex] : null;
+        var targetLabel = opt ? opt.text : '';
+        if (!targetLabel) { btn.textContent = 'Check Transfer Plan'; return; }
         btn.textContent = (currentEnv && currentEnv !== 'Unknown')
-            ? 'Transfer from ' + currentEnv + ' to ' + targetName
-            : 'Transfer to ' + targetName;
+            ? 'Transfer from ' + currentEnv + ' to ' + targetLabel
+            : 'Transfer to ' + targetLabel;
     }
 
     function check() {
@@ -451,7 +453,7 @@ var dxpTransfer = (function () {
         var succeeded = items.filter(function (i) { return i.success; });
         if (succeeded.length > 0) {
             setState('done');
-            showResultWithLinks(data, req.targetEnvironment, failed);
+            showResultWithLinks(data, req.targetEnvironmentLabel || req.targetEnvironment, failed);
         } else {
             var msg = data.errorMessage || '';
             if (failed.length)
@@ -464,10 +466,19 @@ var dxpTransfer = (function () {
 
     function cancel() { plan = null; setState('form'); }
 
+    // The selected target's display label (option text), for UI messaging. The value sent to the
+    // API stays the canonical environment name.
+    function selectedTargetLabel() {
+        var t = document.getElementById('dxp-target');
+        var o = t && t.selectedIndex >= 0 ? t.options[t.selectedIndex] : null;
+        return o ? o.text : (t ? t.value : '');
+    }
+
     function buildRequest() {
         return {
             contentId: contentId,
             targetEnvironment: document.getElementById('dxp-target').value,
+            targetEnvironmentLabel: selectedTargetLabel(),
             includeChildren: document.getElementById('dxp-children').checked,
             overwriteMatchingIds: document.getElementById('dxp-overwrite').checked,
             transferStatus: getStatus(),
@@ -830,7 +841,7 @@ var dxpTransfer = (function () {
     function downloadLog() {
         var lines = ['DXP Content Transfer Log'];
         lines.push('Date: ' + new Date().toISOString());
-        lines.push('Target: ' + (savedReq ? savedReq.targetEnvironment : '?'));
+        lines.push('Target: ' + (savedReq ? (savedReq.targetEnvironmentLabel || savedReq.targetEnvironment) : '?'));
         lines.push('');
 
         function depTypeLabel(nodeType) {

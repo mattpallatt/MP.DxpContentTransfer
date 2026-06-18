@@ -1,6 +1,4 @@
 @model DxpContentTransfer.Models.SettingsViewModel
-@using System.Text.Json
-@using DxpContentTransfer.Services
 @{
     Layout = null;
 }
@@ -62,6 +60,7 @@
             border-color: #2973c3;
             box-shadow: 0 0 0 2px rgba(41,115,195,0.2);
         }
+        .field-note { display: block; margin-top: 5px; color: #5a6b7b; font-size: 12px; }
         .actions { margin-top: 6px; }
         .btn-save {
             padding: 9px 24px;
@@ -139,24 +138,6 @@
             border-radius: 5px;
             box-shadow: 0 1px 3px rgba(17,56,92,0.08);
         }
-        /* Environment-indicator badge fields */
-        .badge-row { display: flex; gap: 16px; align-items: flex-end; flex-wrap: wrap; margin-bottom: 14px; }
-        .badge-row .field { margin-bottom: 0; }
-        .badge-label { flex: 1; min-width: 180px; }
-        .badge-preview-wrap { flex: 0 0 auto; }
-        .badge-preview {
-            display: inline-flex; align-items: center; height: 34px; padding: 0 9px;
-            border-radius: 3px; font-size: 11px; font-weight: 700; letter-spacing: 0.5px;
-            white-space: nowrap; color: #fff; background: #888;
-        }
-        .badge-colour { flex: 0 0 auto; }
-        .badge-colour input[type=color] { width: 46px; height: 34px; padding: 0; border: 1px solid #bbb; border-radius: 4px; background: #fff; cursor: pointer; }
-        .checkbox-field { margin-top: 4px; }
-        .checkbox-label { display: flex; align-items: center; gap: 8px; font-weight: 400; cursor: pointer; }
-        .checkbox-label input { width: auto; }
-        details.advanced { margin-top: 10px; }
-        details.advanced > summary { cursor: pointer; font-weight: 500; padding: 4px 0; user-select: none; }
-        .hint { margin: 6px 0 0; font-size: 12px; color: #5a6b7b; }
     </style>
 </head>
 <body>
@@ -240,19 +221,10 @@
                 <input type="password" id="IntegrationClientSecret" name="IntegrationClientSecret"
                        value="@Model.IntegrationClientSecret" autocomplete="new-password" />
             </div>
-            <div class="badge-row">
-                <div class="field badge-label">
-                    <label for="IntegrationLabel">Environment label</label>
-                    <input type="text" id="IntegrationLabel" name="IntegrationLabel" value="@Model.IntegrationLabel" placeholder="INTEGRATION" maxlength="24" />
-                </div>
-                <div class="field badge-colour">
-                    <label for="IntegrationColor">Badge colour</label>
-                    <input type="color" id="IntegrationColor" name="IntegrationColor" value="@(Model.IntegrationColor ?? "#d4651a")" />
-                </div>
-                <div class="field badge-preview-wrap">
-                    <label>Preview</label>
-                    <span class="badge-preview" data-env="Integration" data-default="INTEGRATION">INTEGRATION</span>
-                </div>
+            <div class="field">
+                <label for="IntegrationLabel">Display label (optional)</label>
+                <input type="text" id="IntegrationLabel" name="IntegrationLabel" value="@Model.IntegrationLabel" placeholder="Integration" maxlength="24" />
+                <small class="field-note">Shown in the transfer gadget instead of &ldquo;Integration&rdquo;. Leave blank to use the default name.</small>
             </div>
             <div class="field-test">
                 <button type="button" class="btn-test" data-env="Integration">Test connection</button>
@@ -277,19 +249,10 @@
                 <input type="password" id="PreproductionClientSecret" name="PreproductionClientSecret"
                        value="@Model.PreproductionClientSecret" autocomplete="new-password" />
             </div>
-            <div class="badge-row">
-                <div class="field badge-label">
-                    <label for="PreproductionLabel">Environment label</label>
-                    <input type="text" id="PreproductionLabel" name="PreproductionLabel" value="@Model.PreproductionLabel" placeholder="PREPRODUCTION" maxlength="24" />
-                </div>
-                <div class="field badge-colour">
-                    <label for="PreproductionColor">Badge colour</label>
-                    <input type="color" id="PreproductionColor" name="PreproductionColor" value="@(Model.PreproductionColor ?? "#7b2fff")" />
-                </div>
-                <div class="field badge-preview-wrap">
-                    <label>Preview</label>
-                    <span class="badge-preview" data-env="Preproduction" data-default="PREPRODUCTION">PREPRODUCTION</span>
-                </div>
+            <div class="field">
+                <label for="PreproductionLabel">Display label (optional)</label>
+                <input type="text" id="PreproductionLabel" name="PreproductionLabel" value="@Model.PreproductionLabel" placeholder="Preproduction" maxlength="24" />
+                <small class="field-note">Shown in the transfer gadget instead of &ldquo;Preproduction&rdquo;. Leave blank to use the default name.</small>
             </div>
             <div class="field-test">
                 <button type="button" class="btn-test" data-env="Preproduction">Test connection</button>
@@ -314,42 +277,15 @@
                 <input type="password" id="ProductionClientSecret" name="ProductionClientSecret"
                        value="@Model.ProductionClientSecret" autocomplete="new-password" />
             </div>
-            <div class="badge-row">
-                <div class="field badge-label">
-                    <label for="ProductionLabel">Environment label</label>
-                    <input type="text" id="ProductionLabel" name="ProductionLabel" value="@Model.ProductionLabel" placeholder="PRODUCTION" maxlength="24" />
-                </div>
-                <div class="field badge-colour">
-                    <label for="ProductionColor">Badge colour</label>
-                    <input type="color" id="ProductionColor" name="ProductionColor" value="@(Model.ProductionColor ?? "#c0392b")" />
-                </div>
-                <div class="field badge-preview-wrap">
-                    <label>Preview</label>
-                    <span class="badge-preview" data-env="Production" data-default="PRODUCTION">PRODUCTION</span>
-                </div>
+            <div class="field">
+                <label for="ProductionLabel">Display label (optional)</label>
+                <input type="text" id="ProductionLabel" name="ProductionLabel" value="@Model.ProductionLabel" placeholder="Production" maxlength="24" />
+                <small class="field-note">Shown in the transfer gadget instead of &ldquo;Production&rdquo;. Leave blank to use the default name.</small>
             </div>
             <div class="field-test">
                 <button type="button" class="btn-test" data-env="Production">Test connection</button>
                 <span class="test-result" data-env="Production" aria-live="polite"></span>
             </div>
-        </fieldset>
-
-        <fieldset>
-            <legend>Environment indicator</legend>
-            <div class="field checkbox-field">
-                <label class="checkbox-label">
-                    <input type="checkbox" name="ShowOnProduction" value="true" @(Model.ShowOnProduction ? "checked" : "") />
-                    Show a badge on Production (on by default — untick to leave production unbadged)
-                </label>
-            </div>
-            <details class="advanced" @(string.IsNullOrWhiteSpace(Model.Selector) ? "" : "open")>
-                <summary>Advanced</summary>
-                <div class="field">
-                    <label for="Selector">Top-bar selector override</label>
-                    <input type="text" id="Selector" name="Selector" value="@Model.Selector" placeholder="@EnvironmentBadge.DefaultSelector" />
-                    <p class="hint">Only change this if a CMS update moves the environment label and the badge stops appearing. Blank uses the built-in default.</p>
-                </div>
-            </details>
         </fieldset>
 
         <div class="actions">
@@ -421,65 +357,5 @@
             });
         })();
     </script>
-
-    <script>
-        // Live preview of each environment's badge: updates as the colour/label change, with the same
-        // WCAG-contrast text colour the server bakes into the real badge (luminance crossover 0.179).
-        (function () {
-            function contrastText(hex) {
-                var m = /^#?([0-9a-f]{3}|[0-9a-f]{6})$/i.exec((hex || '').trim());
-                if (!m) return '#ffffff';
-                var h = m[1];
-                if (h.length === 3) h = h[0] + h[0] + h[1] + h[1] + h[2] + h[2];
-                function lin(c) { c /= 255; return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); }
-                var L = 0.2126 * lin(parseInt(h.substr(0, 2), 16))
-                      + 0.7152 * lin(parseInt(h.substr(2, 2), 16))
-                      + 0.0722 * lin(parseInt(h.substr(4, 2), 16));
-                return L > 0.179 ? '#1a1a1a' : '#ffffff';
-            }
-
-            function update(env) {
-                var labelEl = document.getElementById(env + 'Label');
-                var colorEl = document.getElementById(env + 'Color');
-                var pill = document.querySelector('.badge-preview[data-env="' + env + '"]');
-                if (!pill || !colorEl) return;
-                var label = (labelEl && labelEl.value.trim()) || pill.getAttribute('data-default');
-                pill.textContent = label;
-                pill.style.background = colorEl.value;
-                pill.style.color = contrastText(colorEl.value);
-            }
-
-            ['Integration', 'Preproduction', 'Production'].forEach(function (env) {
-                var l = document.getElementById(env + 'Label');
-                var c = document.getElementById(env + 'Color');
-                if (l) l.addEventListener('input', function () { update(env); });
-                if (c) c.addEventListener('input', function () { update(env); });
-                update(env);
-            });
-        })();
-    </script>
-
-    @if (Model.Saved)
-    {
-        <script>
-            // This page is iframed into the admin shell (same origin), so on save we update the live
-            // environment badge in the parent immediately — no logout/login needed. We key off the
-            // badge's identity attribute (not its visible text, which may be a custom label) and apply
-            // that environment's new label and colours.
-            (function () {
-                try {
-                    var badge = window.top.document.querySelector('.dxp-env-badge');
-                    if (!badge) return;
-                    var map = {
-                        'Integration': { label: @Html.Raw(JsonSerializer.Serialize(EnvironmentBadge.EffectiveLabel("Integration", Model.IntegrationLabel))), bg: '@Model.IntegrationColor', text: '@EnvironmentBadge.TextColor(Model.IntegrationColor)' },
-                        'Preproduction': { label: @Html.Raw(JsonSerializer.Serialize(EnvironmentBadge.EffectiveLabel("Preproduction", Model.PreproductionLabel))), bg: '@Model.PreproductionColor', text: '@EnvironmentBadge.TextColor(Model.PreproductionColor)' },
-                        'Production': { label: @Html.Raw(JsonSerializer.Serialize(EnvironmentBadge.EffectiveLabel("Production", Model.ProductionLabel))), bg: '@Model.ProductionColor', text: '@EnvironmentBadge.TextColor(Model.ProductionColor)' }
-                    };
-                    var c = map[badge.getAttribute('data-dxp-env')];
-                    if (c && c.bg) { badge.textContent = c.label; badge.style.background = c.bg; badge.style.color = c.text; }
-                } catch (e) { /* cross-origin or no parent badge — nothing to update */ }
-            })();
-        </script>
-    }
 </body>
 </html>

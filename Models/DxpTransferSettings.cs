@@ -21,16 +21,11 @@ public class DxpTransferSettings : IDynamicData
     public string ProductionClientKey { get; set; }
     public string ProductionClientSecret { get; set; }
 
-    // Environment-indicator settings (the top-bar badge). Colour/label are per environment; the
-    // selector override and the Production toggle are global. Production is badged by default.
-    public string IntegrationColor { get; set; }
+    // Optional friendly display labels for the transfer UI. Identity stays Integration/Preproduction/
+    // Production; these only change what the editor sees in the gadget.
     public string IntegrationLabel { get; set; }
-    public string PreproductionColor { get; set; }
     public string PreproductionLabel { get; set; }
-    public string ProductionColor { get; set; }
     public string ProductionLabel { get; set; }
-    public string Selector { get; set; }
-    public bool ShowOnProduction { get; set; } = true;
 
     // Computed getters only (no setter, so DDS skips them). Each config is built once on first
     // access and cached — these objects used to be re-allocated on every read, which also meant
@@ -41,11 +36,11 @@ public class DxpTransferSettings : IDynamicData
     private DxpEnvironmentConfig _production;
 
     public DxpEnvironmentConfig Integration => _integration ??=
-        new() { Name = "Integration", BaseUrl = IntegrationBaseUrl, ClientKey = IntegrationClientKey, ClientSecret = IntegrationClientSecret, Color = IntegrationColor, Label = IntegrationLabel };
+        new() { Name = "Integration", BaseUrl = IntegrationBaseUrl, ClientKey = IntegrationClientKey, ClientSecret = IntegrationClientSecret, Label = IntegrationLabel };
     public DxpEnvironmentConfig Preproduction => _preproduction ??=
-        new() { Name = "Preproduction", BaseUrl = PreproductionBaseUrl, ClientKey = PreproductionClientKey, ClientSecret = PreproductionClientSecret, Color = PreproductionColor, Label = PreproductionLabel };
+        new() { Name = "Preproduction", BaseUrl = PreproductionBaseUrl, ClientKey = PreproductionClientKey, ClientSecret = PreproductionClientSecret, Label = PreproductionLabel };
     public DxpEnvironmentConfig Production => _production ??=
-        new() { Name = "Production", BaseUrl = ProductionBaseUrl, ClientKey = ProductionClientKey, ClientSecret = ProductionClientSecret, Color = ProductionColor, Label = ProductionLabel };
+        new() { Name = "Production", BaseUrl = ProductionBaseUrl, ClientKey = ProductionClientKey, ClientSecret = ProductionClientSecret, Label = ProductionLabel };
 
     public IEnumerable<DxpEnvironmentConfig> AllEnvironments =>
         new[] { Integration, Preproduction, Production };
