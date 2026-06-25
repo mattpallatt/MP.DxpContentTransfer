@@ -16,15 +16,14 @@
     <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" />
     <style>
         *, *::before, *::after { box-sizing: border-box; }
+        html, body { margin: 0; padding: 0; background: #fff; }
         body {
             font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
             font-size: 14px;
             line-height: 1.5;
-            margin: 0;
-            padding: 28px 36px;
             color: #1a1a1a;
-            background: #fff;
         }
+        .content-wrapper { padding: 28px 36px; }
         h1 { font-size: 22px; font-weight: 600; margin: 0 0 6px; color: #1a1a1a; }
         .subtitle { color: #666; margin: 0 0 24px; font-size: 14px; }
         .alert { padding: 10px 14px; border-radius: 4px; margin-bottom: 18px; font-size: 14px; }
@@ -145,9 +144,10 @@
         }
     </style>
 </head>
-<body>
+<body class="epi-workspace">
     @Html.CreatePlatformNavigationMenu()
     <div @Html.ApplyPlatformNavigation()>
+    <div class="content-wrapper">
     <h1>DXP Content Transfer Settings</h1>
     <p class="subtitle">Enter the OpenID Connect API credentials for each environment you want to transfer content to or from.</p>
 
@@ -364,6 +364,7 @@
             });
         })();
     </script>
+    </div>
     </div>
 </body>
 </html>

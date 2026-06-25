@@ -5,7 +5,7 @@
     <Nullable>disable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <PackageId>MP.DxpContentTransfer</PackageId>
-    <Version>0.9.1</Version>
+    <Version>0.11.0</Version>
     <Authors>Matt Pallatt</Authors>
     <Description>An Optimizely CMS 12 gadget that lets editors push content between DXP environments (Integration, Preproduction, Production) directly from the editor sidebar — no developer involvement required. (BETA - probably not ideal to be using on Production systems quite yet - except at your own risk).</Description>
     <PackageReadmeFile>README.md</PackageReadmeFile>
