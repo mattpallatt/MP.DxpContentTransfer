@@ -11,8 +11,8 @@ public class DxpTransferMenuProvider : IMenuProvider
         {
             new UrlMenuItem(
                 "DXP Content Transfer",
-                "/global/cms/admin/tools/dxp.transfer",
-                "/EPiServer/EPiServer.Cms.UI.Admin/default#/DxpTransfer/Settings")
+                "/global/cms/dxp.transfer",
+                "/EPiServer/DxpContentTransfer/Admin/Settings")
             {
                 IsAvailable = _ => true,
                 SortIndex = SortIndex.Last + 1

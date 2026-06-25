@@ -1,4 +1,6 @@
 @model DxpContentTransfer.Models.SettingsViewModel
+@using EPiServer.Framework.Web.Resources
+@using EPiServer.Shell.Navigation
 @{
     Layout = null;
 }
@@ -6,7 +8,10 @@
 <html>
 <head>
     <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=Edge" />
     <title>DXP Content Transfer — Settings</title>
+    @ClientResources.RenderResources("ShellCore")
+    @ClientResources.RenderResources("ShellCoreLightTheme")
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" />
     <style>
@@ -141,6 +146,8 @@
     </style>
 </head>
 <body>
+    @Html.CreatePlatformNavigationMenu()
+    <div @Html.ApplyPlatformNavigation()>
     <h1>DXP Content Transfer Settings</h1>
     <p class="subtitle">Enter the OpenID Connect API credentials for each environment you want to transfer content to or from.</p>
 
@@ -357,5 +364,6 @@
             });
         })();
     </script>
+    </div>
 </body>
 </html>
