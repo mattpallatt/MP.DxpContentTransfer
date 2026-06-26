@@ -8,6 +8,9 @@ namespace DxpContentTransfer.Controllers;
 [Authorize(Roles = "CmsAdmins,Administrators,WebAdmins")]
 public class DxpSettingsController : Controller
 {
+    private static readonly bool _isCms13 =
+        typeof(EPiServer.Core.ContentReference).Assembly.GetName().Version?.Major >= 13;
+
     private readonly IDxpSettingsService _settingsService;
     private readonly IEnvironmentHealthService _healthService;
 
@@ -24,7 +27,13 @@ public class DxpSettingsController : Controller
         Response.Headers["X-Frame-Options"] = "SAMEORIGIN";
         var settings = _settingsService.Get();
         var model = MapToViewModel(settings);
-        return View("~/Views/DxpSettings/Index.cshtml", model);
+        // CMS 13: shell-aware view that includes the navigation bundle so the sidebar remains visible.
+        // CMS 12: standalone HTML displayed inside the AdminInit.js iframe overlay — no platform nav
+        //         markup so the admin chrome doesn't render twice inside the iframe.
+        var view = _isCms13
+            ? "~/Views/DxpSettings/Index13.cshtml"
+            : "~/Views/DxpSettings/Index.cshtml";
+        return View(view, model);
     }
 
     [HttpPost]
@@ -46,11 +55,7 @@ public class DxpSettingsController : Controller
 
                 ProductionBaseUrl = model.ProductionBaseUrl?.Trim(),
                 ProductionClientKey = model.ProductionClientKey?.Trim(),
-                ProductionClientSecret = model.ProductionClientSecret?.Trim(),
-
-                IntegrationLabel = Clean(model.IntegrationLabel),
-                PreproductionLabel = Clean(model.PreproductionLabel),
-                ProductionLabel = Clean(model.ProductionLabel)
+                ProductionClientSecret = model.ProductionClientSecret?.Trim()
             };
 
             _settingsService.Save(settings);
@@ -61,7 +66,10 @@ public class DxpSettingsController : Controller
             model.ErrorMessage = $"Failed to save settings: {ex.Message}";
         }
 
-        return View("~/Views/DxpSettings/Index.cshtml", model);
+        var view = _isCms13
+            ? "~/Views/DxpSettings/Index13.cshtml"
+            : "~/Views/DxpSettings/Index.cshtml";
+        return View(view, model);
     }
 
     // Diagnostic probe for the "Test connection" button. Tests the credentials currently in the
@@ -94,12 +102,7 @@ public class DxpSettingsController : Controller
 
         ProductionBaseUrl = settings.Production?.BaseUrl,
         ProductionClientKey = settings.Production?.ClientKey,
-        ProductionClientSecret = settings.Production?.ClientSecret,
-
-        IntegrationLabel = settings.Integration?.Label,
-        PreproductionLabel = settings.Preproduction?.Label,
-        ProductionLabel = settings.Production?.Label
+        ProductionClientSecret = settings.Production?.ClientSecret
     };
 
-    private static string Clean(string value) => string.IsNullOrWhiteSpace(value) ? null : value.Trim();
 }

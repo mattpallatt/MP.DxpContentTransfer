@@ -1,15 +1,8 @@
 @model DxpContentTransfer.Models.SettingsViewModel
+@using EPiServer.Framework.Web.Resources
 @using EPiServer.Shell.Navigation
-@using System.Globalization
 @{
     Layout = null;
-
-    var shellAsm = typeof(EPiServer.Shell.Navigation.IMenuProvider).Assembly.GetName().Version;
-    var shellVer = $"{shellAsm!.Major}.{shellAsm.Minor}.{shellAsm.Build}";
-    var shellBase = $"/Optimizely/Shell/{shellVer}";
-
-    var uiCulture   = CultureInfo.CurrentUICulture;
-    var contCulture = CultureInfo.CurrentCulture;
 }
 <!DOCTYPE html>
 <html>
@@ -17,6 +10,8 @@
     <meta charset="utf-8" />
     <meta http-equiv="X-UA-Compatible" content="IE=Edge" />
     <title>DXP Content Transfer — Settings</title>
+    @ClientResources.RenderResources("ShellCore")
+    @ClientResources.RenderResources("ShellCoreLightTheme")
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" />
     <style>
@@ -150,21 +145,8 @@
     </style>
 </head>
 <body class="epi-workspace">
-    @Html.AntiForgeryToken()
-    <link href="@shellBase/ClientResources/axiom/styles.css" rel="stylesheet" type="text/css" />
-    <div class="epi-navigation epi-navigation-container epi-navigationContainer"
-         data-epi-antiforgery-form-field-name="__RequestVerificationToken"
-         data-epi-antiforgery-header-name="RequestVerificationToken"
-         data-epi-content-language="@contCulture.TwoLetterISOLanguageName"
-         data-epi-current-culture="@contCulture.Name"
-         data-epi-current-ui-culture="@uiCulture.TwoLetterISOLanguageName"
-         data-epi-parent-product=""
-         data-epi-product-id="global_cms"
-         data-epi-shell-url="/Optimizely/Shell/"
-         id="epi-navigation-root"></div>
-    <link href="@shellBase/ClientResources/navigation/navigation.bundle.css" rel="stylesheet" type="text/css" />
-    <script src="@shellBase/ClientResources/navigation/navigation.bundle.js" type="module"></script>
-    <div class="epi-pn-navigation--fixed-adjust">
+    @Html.CreatePlatformNavigationMenu()
+    <div @Html.ApplyPlatformNavigation()>
     <div class="content-wrapper">
     <h1>DXP Content Transfer Settings</h1>
     <p class="subtitle">Enter the OpenID Connect API credentials for each environment you want to transfer content to or from.</p>

@@ -14,11 +14,6 @@ public class SettingsViewModel
     public string ProductionClientKey { get; set; }
     public string ProductionClientSecret { get; set; }
 
-    // Optional friendly display labels for the transfer UI.
-    public string IntegrationLabel { get; set; }
-    public string PreproductionLabel { get; set; }
-    public string ProductionLabel { get; set; }
-
     public bool Saved { get; set; }
     public string ErrorMessage { get; set; }
 }

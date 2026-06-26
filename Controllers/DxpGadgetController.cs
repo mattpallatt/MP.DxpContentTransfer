@@ -54,7 +54,6 @@ public class DxpGadgetController : Controller
             ContentId = contentId,
             ContentName = contentName,
             CurrentEnvironmentName = currentEnv ?? "Unknown",
-            CurrentEnvironmentLabel = currentConfig?.DisplayName ?? "Unknown",
             AvailableTargets = availableTargets,
             IsSettingsConfigured = settings.AllEnvironments.Any(e => e.IsConfigured),
             IsPageContent = isPage,

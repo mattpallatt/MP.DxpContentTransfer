@@ -21,12 +21,6 @@ public class DxpTransferSettings : IDynamicData
     public string ProductionClientKey { get; set; }
     public string ProductionClientSecret { get; set; }
 
-    // Optional friendly display labels for the transfer UI. Identity stays Integration/Preproduction/
-    // Production; these only change what the editor sees in the gadget.
-    public string IntegrationLabel { get; set; }
-    public string PreproductionLabel { get; set; }
-    public string ProductionLabel { get; set; }
-
     // Computed getters only (no setter, so DDS skips them). Each config is built once on first
     // access and cached — these objects used to be re-allocated on every read, which also meant
     // settings.Integration != settings.Integration by reference. The flat strings are fully
@@ -36,11 +30,11 @@ public class DxpTransferSettings : IDynamicData
     private DxpEnvironmentConfig _production;
 
     public DxpEnvironmentConfig Integration => _integration ??=
-        new() { Name = "Integration", BaseUrl = IntegrationBaseUrl, ClientKey = IntegrationClientKey, ClientSecret = IntegrationClientSecret, Label = IntegrationLabel };
+        new() { Name = "Integration", BaseUrl = IntegrationBaseUrl, ClientKey = IntegrationClientKey, ClientSecret = IntegrationClientSecret };
     public DxpEnvironmentConfig Preproduction => _preproduction ??=
-        new() { Name = "Preproduction", BaseUrl = PreproductionBaseUrl, ClientKey = PreproductionClientKey, ClientSecret = PreproductionClientSecret, Label = PreproductionLabel };
+        new() { Name = "Preproduction", BaseUrl = PreproductionBaseUrl, ClientKey = PreproductionClientKey, ClientSecret = PreproductionClientSecret };
     public DxpEnvironmentConfig Production => _production ??=
-        new() { Name = "Production", BaseUrl = ProductionBaseUrl, ClientKey = ProductionClientKey, ClientSecret = ProductionClientSecret, Label = ProductionLabel };
+        new() { Name = "Production", BaseUrl = ProductionBaseUrl, ClientKey = ProductionClientKey, ClientSecret = ProductionClientSecret };
 
     public IEnumerable<DxpEnvironmentConfig> AllEnvironments =>
         new[] { Integration, Preproduction, Production };
